@@ -613,12 +613,29 @@ def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, 
     search_source = focused_section if focused_section else ocr_text
     
     drugs = []
-    # Find all numbered lines like "1. Tab. Napa" or "- Cap. Pregab" or "1) Tab. Diclo"
     for line in search_source.split("\n"):
         line = line.strip()
-        if re.search(r'\b(tab\.|cap\.|syp\.|inj\.)\b', line, re.I) or re.match(r'^\d+[\.\)]\s+', line):
+        if not line:
+            continue
+        if focused_section:
+            if "drug extraction" in line.lower() or "=== " in line:
+                continue
             drugs.append(line)
-            
+        else:
+            if re.search(r'\b(tab\.|cap\.|syp\.|inj\.|tablet|capsule|syrup|medicine|rx)\b', line, re.I) or re.match(r'^[\d\-]+[\.\)]?\s+', line):
+                drugs.append(line)
+                
+    # Deduplicate extracted drug lines while preserving order
+    seen_drugs = set()
+    unique_drugs = []
+    for d in drugs:
+        d_clean = d.strip()
+        norm_d = normalize(d_clean)
+        if norm_d not in seen_drugs and d_clean:
+            seen_drugs.add(norm_d)
+            unique_drugs.append(d_clean)
+    drugs = unique_drugs
+
     # Parse each matched drug line
     for d in drugs:
         parsed_med = parse_drug_line(d)
@@ -1082,12 +1099,6 @@ def extraction_card_html(extraction: dict[str, Any]) -> str:
             ("Address", "address"), ("DEA Number", "dea_number"),
             ("NPI Number", "npi_number"), ("Phone", "phone_number"),
         ]),
-        ("Prescription Details", "prescription_details", [
-            ("Date Issued", "date_of_issuance"), ("Drug Name", "drug_name"),
-            ("Strength", "strength"), ("Dosage Form", "dosage_form"),
-            ("Quantity", "quantity"), ("Directions (Sig)", "directions_sig"),
-            ("Refills", "refills_authorized"), ("Dispense As Written", "dispense_as_written"),
-        ]),
     ]
 
     legibility = extraction.get("document_metadata", {}).get("overall_legibility_score", 0)
@@ -1108,6 +1119,55 @@ def extraction_card_html(extraction: dict[str, Any]) -> str:
                 f'<dd>{_display_value(val)} {_confidence_badge(conf)}</dd>'
             )
         html_parts.append('</dl></div>')
+
+    # Add the Medications list section
+    html_parts.append(f'<div class="extraction-section">')
+    html_parts.append(f'<h4>All Extracted Medications</h4>')
+    meds = extraction.get("medications", [])
+    if meds:
+        html_parts.append('<table class="candidate-table" style="width: 100%; border-collapse: collapse; margin-top: 8px;">')
+        html_parts.append('<thead><tr><th>#</th><th>Drug Name</th><th>Dosage Form</th><th>Strength</th><th>Directions (Sig)</th></tr></thead>')
+        html_parts.append('<tbody>')
+        for idx, med in enumerate(meds, start=1):
+            dname = med.get("drug_name", {}).get("value") or "Unknown"
+            dname_conf = med.get("drug_name", {}).get("confidence", 0.0)
+            
+            form = med.get("dosage_form", {}).get("value") or "-"
+            strength = med.get("strength", {}).get("value") or "-"
+            sig = med.get("directions_sig", {}).get("value") or "-"
+            
+            html_parts.append(
+                f'<tr>'
+                f'<td>{idx}</td>'
+                f'<td><strong>{dname}</strong> {_confidence_badge(dname_conf)}</td>'
+                f'<td>{form}</td>'
+                f'<td>{strength}</td>'
+                f'<td><code>{sig}</code></td>'
+                f'</tr>'
+            )
+        html_parts.append('</tbody></table>')
+    else:
+        html_parts.append('<p style="color: var(--muted); font-style: italic;">No medications detected.</p>')
+    html_parts.append('</div>')
+
+    # Add Prescription Details (refills, date issued, etc.)
+    html_parts.append(f'<div class="extraction-section">')
+    html_parts.append(f'<h4>Prescription Metadata</h4>')
+    html_parts.append('<dl class="extraction-fields">')
+    meta_fields = [
+        ("Date Issued", "date_of_issuance"),
+        ("Refills Authorized", "refills_authorized"),
+        ("Dispense As Written", "dispense_as_written"),
+    ]
+    for label, field_key in meta_fields:
+        field = extraction.get("prescription_details", {}).get(field_key, {})
+        val = field.get("value")
+        conf = field.get("confidence", 0.0)
+        html_parts.append(
+            f'<dt>{label}</dt>'
+            f'<dd>{_display_value(val)} {_confidence_badge(conf)}</dd>'
+        )
+    html_parts.append('</dl></div>')
 
     html_parts.append('</div>')
     return "\n".join(html_parts)
@@ -1290,14 +1350,21 @@ def run_minicpm_ocr(pil_image: Image.Image) -> tuple[str, Image.Image]:
             OCR_MODEL = OCR_MODEL.cuda()
 
     # Pass 1A: Grounding to detect handwritten prescription items
-    grounding_prompt = "Identify each numbered handwritten medication line or direction. Return coordinate boxes in <box>(ymin,xmin,ymax,xmax)</box> format."
+    grounding_prompt = "Identify all handwritten text regions (such as patient name, patient age, prescriber signature, drug name, dosage, refills). Return the coordinate boxes of these regions in [[ymin,xmin,ymax,xmax]] format."
     grounding_output = _run_minicpm_single_pass(pil_image, grounding_prompt, max_tokens=512)
 
-    # Parse coordinates
+    # Parse coordinates robustly supporting both brackets [[ymin,xmin,ymax,xmax]] and parentheses (ymin,xmin,ymax,xmax)
+    normalized_output = re.sub(r'\s+', ' ', grounding_output)
+    raw_matches = re.findall(r'(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})', normalized_output)
     boxes = []
-    matches = re.findall(r'\((\d+),(\d+),(\d+),(\d+)\)', grounding_output)
-    for m in matches:
-        boxes.append((int(m[0]), int(m[1]), int(m[2]), int(m[3])))
+    for m in raw_matches:
+        try:
+            ymin, xmin, ymax, xmax = map(int, m)
+            if all(0 <= val <= 1000 for val in (ymin, xmin, ymax, xmax)):
+                if ymax > ymin and xmax > xmin:
+                    boxes.append((ymin, xmin, ymax, xmax))
+        except ValueError:
+            continue
 
     width, height = pil_image.size
     cropped_ocr_results = []
@@ -1313,8 +1380,9 @@ def run_minicpm_ocr(pil_image: Image.Image) -> tuple[str, Image.Image]:
         xmax = int(xmax_n * width / 1000)
         
         # Draw bounding box
-        draw.rectangle([xmin, ymin, xmax, ymax], outline="#0f9f6e", width=3)
-        draw.text((xmin + 5, max(0, ymin - 15)), f"Rx {i}", fill="#0f9f6e")
+        draw.rectangle([xmin, ymin, xmax, ymax], outline="#10b981", width=4)
+        draw.rectangle([xmin, max(0, ymin - 20), xmin + 45, ymin], fill="#10b981")
+        draw.text((xmin + 5, max(0, ymin - 18)), f"Rx {i}", fill="white")
 
         # Crop region with 15px padding
         padding = 15

@@ -130,18 +130,17 @@ RULES:
 # Pass 2: Nemotron structures the raw OCR into the clinical JSON schema
 STRUCTURING_PROMPT_TEMPLATE = """You are a HIPAA-compliant Clinical Data Extraction Agent.
 
-You have been given raw OCR text extracted from a medical prescription image. Parse this text into structured JSON containing all prescribed medications.
+You have been given raw OCR text extracted from a medical prescription image. Parse this text into structured JSON.
 
 STRICT RULES:
 1. ZERO HALLUCINATION: If a field is not found, output null. Do NOT guess.
 2. NO CLINICAL TRANSLATION: Extract Sig/directions EXACTLY as written (e.g., "2+0+2", "1 tab PO BID"). Do NOT expand.
 3. Assign confidence (0.00 to 1.00) based on clarity in the OCR text.
-4. Extract ALL medications list. Do not extract only one.
-5. Correct obvious spelling errors using clinical context (e.g. if the OCR text lists 'Bromophenol' in a knee pain prescription, correct it to the actual intended medicine name like 'Pregabalin' or 'Pregab').
-6. For directions_sig: include the dosage pattern (e.g., "2+0+2" or "1+0+1") and any duration mentioned.
-7. Dosage forms: Tab. = tablets, Cap. = capsules, Syp. = syrup, Inj. = injection, Susp. = suspension.
-8. Look for patient name after "Name:" or "নাম:" fields. Look for date after "Date:" or "তারিখ:".
-9. Doctor name is usually printed at the top or bottom of the prescription.
+4. For drug_name: extract the FIRST/PRIMARY drug prescribed (e.g., "Tab. Diclofenac" → "Diclofenac"). If multiple drugs, use the first one.
+5. For directions_sig: include the dosage pattern (e.g., "2+0+2" or "1+0+1") and any duration mentioned.
+6. Dosage forms: Tab. = tablets, Cap. = capsules, Syp. = syrup, Inj. = injection, Susp. = suspension.
+7. Look for patient name after "Name:" or "নাম:" fields. Look for date after "Date:" or "তারিখ:".
+8. Doctor name is usually printed at the top or bottom of the prescription.
 
 RAW OCR TEXT:
 ---
@@ -170,18 +169,14 @@ Return ONLY valid JSON (no markdown, no explanation):
   }},
   "prescription_details": {{
     "date_of_issuance": {{ "value": null, "confidence": 0.0 }},
+    "drug_name": {{ "value": null, "confidence": 0.0 }},
+    "strength": {{ "value": null, "confidence": 0.0 }},
+    "dosage_form": {{ "value": null, "confidence": 0.0 }},
+    "quantity": {{ "value": null, "confidence": 0.0 }},
+    "directions_sig": {{ "value": null, "confidence": 0.0 }},
     "refills_authorized": {{ "value": null, "confidence": 0.0 }},
     "dispense_as_written": {{ "value": null, "confidence": 0.0 }}
-  }},
-  "medications": [
-    {{
-      "drug_name": {{ "value": null, "confidence": 0.0 }},
-      "strength": {{ "value": null, "confidence": 0.0 }},
-      "dosage_form": {{ "value": null, "confidence": 0.0 }},
-      "quantity": {{ "value": null, "confidence": 0.0 }},
-      "directions_sig": {{ "value": null, "confidence": 0.0 }}
-    }}
-  ]
+  }}
 }}"""
 
 
@@ -281,7 +276,22 @@ def web_search_generic(drug_name: str) -> str | None:
     import requests
     import re
 
-    query = f"{drug_name} active ingredient generic name"
+    # Clean the drug name for search: extract the brand name itself
+    # e.g., "Tab. Ultrafen-plus 500mg 2+0+2" -> "Ultrafen-plus"
+    clean_brand = drug_name.strip()
+    # Remove dosage forms
+    for form in (r'\btab\b', r'\bcap\b', r'\bsyp\b', r'\binj\b', r'\bsusp\b', r'\btablet\b', r'\bcapsule\b', r'\bsyrup\b'):
+        clean_brand = re.sub(form, '', clean_brand, flags=re.I)
+    # Remove strengths
+    clean_brand = re.sub(r'\b\d+\s*(mg|g|ml|mcg)\b', '', clean_brand, flags=re.I)
+    # Remove dosage sigs
+    clean_brand = re.sub(r'\b\d+\s*[\+\-]\s*\d+\s*[\+\-]\s*\d+\b', '', clean_brand)
+    # Remove formatting characters
+    clean_brand = " ".join(clean_brand.strip(" ,.-+()[]{}*/\\").split())
+    if not clean_brand:
+        clean_brand = drug_name
+
+    query = f"{clean_brand} generic name active ingredient"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
@@ -290,8 +300,13 @@ def web_search_generic(drug_name: str) -> str | None:
         res = requests.post(url, data={"q": query}, headers=headers, timeout=5)
         if res.status_code == 200:
             text = res.text
-            clean_text = re.sub(r'<[^>]+>', ' ', text).lower()
-            return clean_text
+            # Extract text ONLY from the result snippet table cells to avoid global page noise
+            snippets = re.findall(r'<td\s+class=["\']result-snippet["\'][\s\S]*?>([\s\S]*?)</td>', text)
+            if snippets:
+                snippets_text = " ".join(snippets)
+                # Strip HTML tags
+                clean_text = re.sub(r'<[^>]+>', ' ', snippets_text).lower()
+                return clean_text
     except Exception:
         pass
     return None
@@ -475,6 +490,48 @@ def _field(value: Any = None, confidence: float = 0.0) -> dict:
     return {"value": value, "confidence": confidence}
 
 
+def parse_drug_line(line: str) -> dict[str, Any]:
+    """Parse a single raw OCR drug line into structured fields using regex."""
+    line_clean = line.strip().removeprefix("-").strip()
+    line_clean = re.sub(r'^\d+[\.\)]\s*', '', line_clean)
+    
+    dosage_form = None
+    for form in ("tab.", "cap.", "syp.", "inj.", "susp.", "tablet", "capsule", "syrup"):
+        if line_clean.lower().startswith(form):
+            dosage_form = form.title()
+            line_clean = line_clean[len(form):].strip()
+            break
+            
+    strength = None
+    m_str = re.search(r'\b\d+\s*(mg|g|ml|mcg)\b', line_clean, re.I)
+    if m_str:
+        strength = m_str.group(0)
+        line_clean = line_clean.replace(strength, "").strip()
+        
+    sig = None
+    m_sig = re.search(r'\b\d+[\+\-]\d+[\+\-]\d+\b', line_clean)
+    if m_sig:
+        sig = m_sig.group(0)
+        line_clean = line_clean.replace(sig, "").strip()
+    else:
+        m_sig_text = re.search(r'\b(once daily|twice daily|daily|bid|tid|qid|qd|hs|po)\b', line_clean, re.I)
+        if m_sig_text:
+            sig = m_sig_text.group(0)
+            line_clean = line_clean.replace(m_sig_text.group(0), "").strip()
+            
+    drug_name = " ".join(line_clean.strip(" ,.-+()[]{}*/\\").split())
+    if not drug_name:
+        drug_name = "Unknown"
+        
+    return {
+        "drug_name": _field(drug_name, 0.8),
+        "strength": _field(strength, 0.8 if strength else 0.0),
+        "dosage_form": _field(dosage_form, 0.8 if dosage_form else 0.0),
+        "directions_sig": _field(sig, 0.8 if sig else 0.0),
+        "quantity": _field(None, 0.0)
+    }
+
+
 def empty_extraction() -> dict[str, Any]:
     """Return a blank extraction schema."""
     return {
@@ -492,9 +549,10 @@ def empty_extraction() -> dict[str, Any]:
             "npi_number": _field(), "phone_number": _field(),
         },
         "prescription_details": {
-            "date_of_issuance": _field(),
-            "refills_authorized": _field(),
-            "dispense_as_written": _field(None),
+            "date_of_issuance": _field(), "drug_name": _field(),
+            "strength": _field(), "dosage_form": _field(),
+            "quantity": _field(), "directions_sig": _field(),
+            "refills_authorized": _field(), "dispense_as_written": _field(None),
         },
         "medications": []  # List of medication dicts
     }
@@ -534,8 +592,8 @@ def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, 
         if "document_metadata" in parsed:
             extraction["document_metadata"].update(parsed["document_metadata"])
         
-        # Parse patient_info and prescriber_info
-        for section in ("patient_info", "prescriber_info"):
+        # Parse patient_info, prescriber_info, and prescription_details from stable schema
+        for section in ("patient_info", "prescriber_info", "prescription_details"):
             if section in parsed:
                 for key, val in parsed[section].items():
                     if key in extraction[section]:
@@ -543,67 +601,39 @@ def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, 
                             extraction[section][key] = val
                         else:
                             extraction[section][key] = _field(val, 0.5)
-        
-        # Parse prescription_details
-        if "prescription_details" in parsed:
-            for key, val in parsed["prescription_details"].items():
-                if key in extraction["prescription_details"]:
-                    if isinstance(val, dict) and "value" in val:
-                        extraction["prescription_details"][key] = val
-                    else:
-                        extraction["prescription_details"][key] = _field(val, 0.5)
-
-        # Parse medications list
-        if "medications" in parsed and isinstance(parsed["medications"], list):
-            for med in parsed["medications"]:
-                med_item = {
-                    "drug_name": _field(med.get("drug_name", {}).get("value") if isinstance(med.get("drug_name"), dict) else med.get("drug_name")),
-                    "strength": _field(med.get("strength", {}).get("value") if isinstance(med.get("strength"), dict) else med.get("strength")),
-                    "dosage_form": _field(med.get("dosage_form", {}).get("value") if isinstance(med.get("dosage_form"), dict) else med.get("dosage_form")),
-                    "quantity": _field(med.get("quantity", {}).get("value") if isinstance(med.get("quantity"), dict) else med.get("quantity")),
-                    "directions_sig": _field(med.get("directions_sig", {}).get("value") if isinstance(med.get("directions_sig"), dict) else med.get("directions_sig")),
-                }
-                for fk in med_item:
-                    if fk in med and isinstance(med[fk], dict) and "confidence" in med[fk]:
-                        med_item[fk]["confidence"] = med[fk]["confidence"]
-                extraction["medications"].append(med_item)
-
-        # Fallback to single medication format if returned
-        elif "prescription_details" in parsed and "drug_name" in parsed["prescription_details"]:
-            old_details = parsed["prescription_details"]
-            med_item = {
-                "drug_name": _field(old_details.get("drug_name", {}).get("value") if isinstance(old_details.get("drug_name"), dict) else old_details.get("drug_name")),
-                "strength": _field(old_details.get("strength", {}).get("value") if isinstance(old_details.get("strength"), dict) else old_details.get("strength")),
-                "dosage_form": _field(old_details.get("dosage_form", {}).get("value") if isinstance(old_details.get("dosage_form"), dict) else old_details.get("dosage_form")),
-                "quantity": _field(old_details.get("quantity", {}).get("value") if isinstance(old_details.get("quantity"), dict) else old_details.get("quantity")),
-                "directions_sig": _field(old_details.get("directions_sig", {}).get("value") if isinstance(old_details.get("directions_sig"), dict) else old_details.get("directions_sig")),
-            }
-            for fk in med_item:
-                if fk in old_details and isinstance(old_details[fk], dict) and "confidence" in old_details[fk]:
-                    med_item[fk]["confidence"] = old_details[fk]["confidence"]
-            extraction["medications"].append(med_item)
-
     except Exception:
         pass
 
-    # Fallback to OCR text parsing if list is still empty
+    # Extract all medications from OCR text (drug-focused section first)
+    focused_section = ""
+    focused_pass_match = re.search(r'=== DRUG EXTRACTION \(focused pass\) ===([\s\S]*?)(===|$)', ocr_text)
+    if focused_pass_match:
+        focused_section = focused_pass_match.group(1).strip()
+    
+    search_source = focused_section if focused_section else ocr_text
+    
+    drugs = []
+    # Find all numbered lines like "1. Tab. Napa" or "- Cap. Pregab" or "1) Tab. Diclo"
+    for line in search_source.split("\n"):
+        line = line.strip()
+        if re.search(r'\b(tab\.|cap\.|syp\.|inj\.)\b', line, re.I) or re.match(r'^\d+[\.\)]\s+', line):
+            drugs.append(line)
+            
+    # Parse each matched drug line
+    for d in drugs:
+        parsed_med = parse_drug_line(d)
+        extraction["medications"].append(parsed_med)
+        
+    # If still empty, fall back to the single drug parsed by Nemotron or clean_prediction
     if not extraction["medications"]:
-        drugs = []
-        for line in ocr_text.split("\n"):
-            m = re.search(r'\b(tab\.|cap\.|syp\.|inj\.)\s+([a-z0-9\-\s\+]+)', line, re.I)
-            if m:
-                drugs.append(m.group(0).strip())
-        if not drugs:
-            drug_guess = clean_prediction(ocr_text)
-            if drug_guess:
-                drugs.append(drug_guess)
-        for d in drugs:
+        drug_val = get_field_value(extraction, "prescription_details", "drug_name") or clean_prediction(ocr_text)
+        if drug_val:
             extraction["medications"].append({
-                "drug_name": _field(d, 0.3),
-                "strength": _field(None, 0.0),
-                "dosage_form": _field(None, 0.0),
-                "quantity": _field(None, 0.0),
-                "directions_sig": _field(None, 0.0),
+                "drug_name": _field(drug_val, 0.5),
+                "strength": extraction["prescription_details"].get("strength", _field()),
+                "dosage_form": extraction["prescription_details"].get("dosage_form", _field()),
+                "quantity": extraction["prescription_details"].get("quantity", _field()),
+                "directions_sig": extraction["prescription_details"].get("directions_sig", _field()),
             })
 
     # Apply controlled substance check on all medications
@@ -1238,8 +1268,8 @@ def _run_minicpm_single_pass(pil_image: Image.Image, prompt: str, max_tokens: in
     return raw.strip()
 
 
-def run_minicpm_ocr(pil_image: Image.Image) -> str:
-    """Multi-pass OCR: Run focused drug extraction first, then full text extraction, and combine."""
+def run_minicpm_ocr(pil_image: Image.Image) -> tuple[str, Image.Image]:
+    """Multi-pass segment-and-crop OCR: Locate handwriting, draw bounding boxes, crop and perform targeted OCR."""
     global OCR_MODEL, OCR_TOKENIZER
 
     try:
@@ -1259,19 +1289,66 @@ def run_minicpm_ocr(pil_image: Image.Image) -> str:
         if torch.cuda.is_available():
             OCR_MODEL = OCR_MODEL.cuda()
 
-    # Pass 1A: Focused drug extraction (short, direct)
-    drug_pass = _run_minicpm_single_pass(pil_image, DRUG_FOCUSED_PROMPT, max_tokens=512)
+    # Pass 1A: Grounding to detect handwritten prescription items
+    grounding_prompt = "Identify each numbered handwritten medication line or direction. Return coordinate boxes in <box>(ymin,xmin,ymax,xmax)</box> format."
+    grounding_output = _run_minicpm_single_pass(pil_image, grounding_prompt, max_tokens=512)
+
+    # Parse coordinates
+    boxes = []
+    matches = re.findall(r'\((\d+),(\d+),(\d+),(\d+)\)', grounding_output)
+    for m in matches:
+        boxes.append((int(m[0]), int(m[1]), int(m[2]), int(m[3])))
+
+    width, height = pil_image.size
+    cropped_ocr_results = []
+    
+    # Create annotated image with green bounding boxes
+    annotated_image = pil_image.copy()
+    draw = ImageDraw.Draw(annotated_image)
+
+    for i, (ymin_n, xmin_n, ymax_n, xmax_n) in enumerate(boxes, start=1):
+        ymin = int(ymin_n * height / 1000)
+        xmin = int(xmin_n * width / 1000)
+        ymax = int(ymax_n * height / 1000)
+        xmax = int(xmax_n * width / 1000)
+        
+        # Draw bounding box
+        draw.rectangle([xmin, ymin, xmax, ymax], outline="#0f9f6e", width=3)
+        draw.text((xmin + 5, max(0, ymin - 15)), f"Rx {i}", fill="#0f9f6e")
+
+        # Crop region with 15px padding
+        padding = 15
+        crop_box = (
+            max(0, xmin - padding),
+            max(0, ymin - padding),
+            min(width, xmax + padding),
+            min(height, ymax + padding)
+        )
+        try:
+            cropped_img = pil_image.crop(crop_box)
+            crop_prompt = "Transcribe the handwritten clinical drug name, strength, or directions in this image crop."
+            crop_ocr = _run_minicpm_single_pass(cropped_img, crop_prompt, max_tokens=128)
+            if crop_ocr.strip():
+                cropped_ocr_results.append(f"{i}. {crop_ocr.strip()}")
+        except Exception:
+            pass
+
+    # Compile the drug pass text
+    if cropped_ocr_results:
+        drug_pass = "\n".join(cropped_ocr_results)
+    else:
+        # Fallback: run standard focused drug pass on the whole image
+        drug_pass = _run_minicpm_single_pass(pil_image, DRUG_FOCUSED_PROMPT, max_tokens=512)
 
     # Pass 1B: Full prescription text extraction
     full_pass = _run_minicpm_single_pass(pil_image, FULL_OCR_PROMPT, max_tokens=1024)
 
-    # Combine both passes — drug-focused pass takes priority for medication data
     combined = f"""=== DRUG EXTRACTION (focused pass) ===
 {drug_pass}
 
 === FULL PRESCRIPTION TEXT ===
 {full_pass}"""
-    return combined
+    return combined, annotated_image
 
 
 # ── Main Analysis Pipeline ───────────────────────────────────────────────────
@@ -1288,7 +1365,7 @@ def analyze_prescription(image, progress=gr.Progress()):
 
     # Step 2: MiniCPM-V full text OCR
     progress(0.20, desc="MiniCPM-V multi-pass OCR (drug-focused + full text)...")
-    ocr_text = run_minicpm_ocr(image)
+    ocr_text, annotated_image = run_minicpm_ocr(image)
     unload_ocr_model()
 
     # Step 3: Nemotron structuring
@@ -1375,6 +1452,7 @@ def analyze_prescription(image, progress=gr.Progress()):
         compliance_banner_html(extraction),
         extraction_card_html(extraction),
         medicine_details_html(active["medicine"], active["inventory"], ocr_text, active["display_name"], active["confidence"], active["plan"]),
+        annotated_image,
         package_image_val,
         package_status_html(active["inventory"], active["accepted"]),
         confidence_gauge(active["confidence"]),
@@ -1831,10 +1909,12 @@ with gr.Blocks(title="PharmaCopilot") as demo:
         compliance_banner = gr.HTML()
         extraction_card = gr.HTML()
         with gr.Row():
-            with gr.Column(scale=5):
+            with gr.Column(scale=4):
                 details = gr.HTML()
                 gauge = gr.Plot(label="Confidence Gauge")
-            with gr.Column(scale=5):
+            with gr.Column(scale=4):
+                segmented_image = gr.Image(label="Segmented Bounding Boxes", height=360)
+            with gr.Column(scale=4):
                 package_image = gr.Image(label="Packaging Image", height=360)
                 stock = gr.HTML()
         with gr.Accordion("Top Candidates", open=False):
@@ -1869,6 +1949,7 @@ with gr.Blocks(title="PharmaCopilot") as demo:
             compliance_banner,
             extraction_card,
             details,
+            segmented_image,
             package_image,
             stock,
             gauge,

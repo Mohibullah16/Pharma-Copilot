@@ -46,8 +46,8 @@ def data_path(relative_path: str) -> Path:
     return DATA_DIR / relative
 
 
-MEDICINES_PATH = data_path("medicines_master.json")
-BRAND_MAP_PATH = data_path("training/bd_brand_to_generic.json")
+MEDICINES_PATH = DATA_DIR / "medicines_master.json"
+BRAND_MAP_PATH = DATA_DIR / "training/bd_brand_to_generic.json"
 INVENTORY_PATH = data_path("inventory.json")
 
 MODEL_ID = os.getenv("PHARMACOPILOT_MODEL_ID", "openbmb/MiniCPM-V-4_5")
@@ -130,17 +130,18 @@ RULES:
 # Pass 2: Nemotron structures the raw OCR into the clinical JSON schema
 STRUCTURING_PROMPT_TEMPLATE = """You are a HIPAA-compliant Clinical Data Extraction Agent.
 
-You have been given raw OCR text extracted from a medical prescription image. Parse this text into structured JSON.
+You have been given raw OCR text extracted from a medical prescription image. Parse this text into structured JSON containing all prescribed medications.
 
 STRICT RULES:
 1. ZERO HALLUCINATION: If a field is not found, output null. Do NOT guess.
 2. NO CLINICAL TRANSLATION: Extract Sig/directions EXACTLY as written (e.g., "2+0+2", "1 tab PO BID"). Do NOT expand.
 3. Assign confidence (0.00 to 1.00) based on clarity in the OCR text.
-4. For drug_name: extract the FIRST/PRIMARY drug prescribed (e.g., "Tab. Diclofenac" → "Diclofenac"). If multiple drugs, use the first one.
-5. For directions_sig: include the dosage pattern (e.g., "2+0+2" or "1+0+1") and any duration mentioned.
-6. Dosage forms: Tab. = tablets, Cap. = capsules, Syp. = syrup, Inj. = injection, Susp. = suspension.
-7. Look for patient name after "Name:" or "নাম:" fields. Look for date after "Date:" or "তারিখ:".
-8. Doctor name is usually printed at the top or bottom of the prescription.
+4. Extract ALL medications list. Do not extract only one.
+5. Correct obvious spelling errors using clinical context (e.g. if the OCR text lists 'Bromophenol' in a knee pain prescription, correct it to the actual intended medicine name like 'Pregabalin' or 'Pregab').
+6. For directions_sig: include the dosage pattern (e.g., "2+0+2" or "1+0+1") and any duration mentioned.
+7. Dosage forms: Tab. = tablets, Cap. = capsules, Syp. = syrup, Inj. = injection, Susp. = suspension.
+8. Look for patient name after "Name:" or "নাম:" fields. Look for date after "Date:" or "তারিখ:".
+9. Doctor name is usually printed at the top or bottom of the prescription.
 
 RAW OCR TEXT:
 ---
@@ -169,14 +170,18 @@ Return ONLY valid JSON (no markdown, no explanation):
   }},
   "prescription_details": {{
     "date_of_issuance": {{ "value": null, "confidence": 0.0 }},
-    "drug_name": {{ "value": null, "confidence": 0.0 }},
-    "strength": {{ "value": null, "confidence": 0.0 }},
-    "dosage_form": {{ "value": null, "confidence": 0.0 }},
-    "quantity": {{ "value": null, "confidence": 0.0 }},
-    "directions_sig": {{ "value": null, "confidence": 0.0 }},
     "refills_authorized": {{ "value": null, "confidence": 0.0 }},
     "dispense_as_written": {{ "value": null, "confidence": 0.0 }}
-  }}
+  }},
+  "medications": [
+    {{
+      "drug_name": {{ "value": null, "confidence": 0.0 }},
+      "strength": {{ "value": null, "confidence": 0.0 }},
+      "dosage_form": {{ "value": null, "confidence": 0.0 }},
+      "quantity": {{ "value": null, "confidence": 0.0 }},
+      "directions_sig": {{ "value": null, "confidence": 0.0 }}
+    }}
+  ]
 }}"""
 
 
@@ -271,6 +276,52 @@ def label_for_medicine(ocr_text: str, medicine: dict[str, Any]) -> str:
     return brands[0] if brands else medicine["name"]
 
 
+def web_search_generic(drug_name: str) -> str | None:
+    """Use a web search to find the generic name/active ingredient of a brand name."""
+    import requests
+    import re
+
+    query = f"{drug_name} active ingredient generic name"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    }
+    try:
+        url = "https://lite.duckduckgo.com/lite/"
+        res = requests.post(url, data={"q": query}, headers=headers, timeout=5)
+        if res.status_code == 200:
+            text = res.text
+            clean_text = re.sub(r'<[^>]+>', ' ', text).lower()
+            return clean_text
+    except Exception:
+        pass
+    return None
+
+
+def resolve_generic_via_web(drug_name: str) -> dict[str, Any] | None:
+    """Query the web for the brand name and find a matching generic name from MEDICINES."""
+    search_text = web_search_generic(drug_name)
+    if not search_text:
+        return None
+
+    best_med = None
+    best_match_len = 0
+
+    for med in MEDICINES:
+        canon = med["name"].lower()
+        if canon in search_text:
+            if len(canon) > best_match_len:
+                best_med = med
+                best_match_len = len(canon)
+
+        gen = med.get("generic_name", "").lower()
+        if gen and gen in search_text:
+            if len(gen) > best_match_len:
+                best_med = med
+                best_match_len = len(gen)
+
+    return best_med
+
+
 def find_medicine_from_ocr(ocr_text: str, strength_hint: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str, int]:
     """Find medicine from OCR text with optional strength disambiguation."""
     query = normalize(ocr_text)
@@ -303,8 +354,21 @@ def find_medicine_from_ocr(ocr_text: str, strength_hint: str | None = None) -> t
         display_name = clean_prediction(ocr_text) or "Needs review"
         primary_score = 0.0
 
+    confidence = max(0, min(99, round(primary_score * 100)))
+
+    # Fallback to Internet Search Agent if confidence is low (below ACCEPTANCE_THRESHOLD)
+    if confidence < ACCEPTANCE_THRESHOLD and query:
+        web_med = resolve_generic_via_web(ocr_text)
+        if web_med:
+            medicine = web_med
+            display_name = label_for_medicine(ocr_text, medicine)
+            confidence = 95  # Web-verified match gets high confidence
+            primary_score = 0.95
+
     top = [{"label": display_name, "medicine": medicine, "score": primary_score}]
     seen_ids = {medicine["id"]}
+    
+    # Re-score candidates or append them
     for item in scored:
         if item["medicine"]["id"] in seen_ids:
             continue
@@ -324,7 +388,6 @@ def find_medicine_from_ocr(ocr_text: str, strength_hint: str | None = None) -> t
                 continue
         break
 
-    confidence = max(0, min(99, round(primary_score * 100)))
     return medicine, top, display_name, confidence
 
 
@@ -429,23 +492,31 @@ def empty_extraction() -> dict[str, Any]:
             "npi_number": _field(), "phone_number": _field(),
         },
         "prescription_details": {
-            "date_of_issuance": _field(), "drug_name": _field(),
-            "strength": _field(), "dosage_form": _field(),
-            "quantity": _field(), "directions_sig": _field(),
-            "refills_authorized": _field(), "dispense_as_written": _field(None),
+            "date_of_issuance": _field(),
+            "refills_authorized": _field(),
+            "dispense_as_written": _field(None),
         },
+        "medications": []  # List of medication dicts
     }
 
 
 def calculate_fallback_legibility(extraction: dict[str, Any]) -> float:
     scores = []
+    # 1. Non-medication sections
     for section_key in ("patient_info", "prescriber_info", "prescription_details"):
         section = extraction.get(section_key, {})
         for field_key, field in section.items():
             if isinstance(field, dict):
                 val = field.get("value")
                 conf = field.get("confidence", 0.0)
-                # Only average fields that were actually detected and not false/empty
+                if val is not None and val != "" and val is not False:
+                    scores.append(conf)
+    # 2. Medications list
+    for med in extraction.get("medications", []):
+        for field_key, field in med.items():
+            if isinstance(field, dict):
+                val = field.get("value")
+                conf = field.get("confidence", 0.0)
                 if val is not None and val != "" and val is not False:
                     scores.append(conf)
     if not scores:
@@ -462,7 +533,9 @@ def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, 
         # Merge parsed data into extraction, preserving schema structure
         if "document_metadata" in parsed:
             extraction["document_metadata"].update(parsed["document_metadata"])
-        for section in ("patient_info", "prescriber_info", "prescription_details"):
+        
+        # Parse patient_info and prescriber_info
+        for section in ("patient_info", "prescriber_info"):
             if section in parsed:
                 for key, val in parsed[section].items():
                     if key in extraction[section]:
@@ -470,16 +543,74 @@ def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, 
                             extraction[section][key] = val
                         else:
                             extraction[section][key] = _field(val, 0.5)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        # Fallback: try to extract drug name from raw text
-        drug_guess = clean_prediction(ocr_text or raw_text)
-        if drug_guess:
-            extraction["prescription_details"]["drug_name"] = _field(drug_guess, 0.3)
+        
+        # Parse prescription_details
+        if "prescription_details" in parsed:
+            for key, val in parsed["prescription_details"].items():
+                if key in extraction["prescription_details"]:
+                    if isinstance(val, dict) and "value" in val:
+                        extraction["prescription_details"][key] = val
+                    else:
+                        extraction["prescription_details"][key] = _field(val, 0.5)
 
-    # Apply controlled substance check using our lookup
-    drug_val = extraction["prescription_details"]["drug_name"].get("value")
-    if drug_val and is_controlled_substance(drug_val):
-        extraction["document_metadata"]["is_controlled_substance"] = True
+        # Parse medications list
+        if "medications" in parsed and isinstance(parsed["medications"], list):
+            for med in parsed["medications"]:
+                med_item = {
+                    "drug_name": _field(med.get("drug_name", {}).get("value") if isinstance(med.get("drug_name"), dict) else med.get("drug_name")),
+                    "strength": _field(med.get("strength", {}).get("value") if isinstance(med.get("strength"), dict) else med.get("strength")),
+                    "dosage_form": _field(med.get("dosage_form", {}).get("value") if isinstance(med.get("dosage_form"), dict) else med.get("dosage_form")),
+                    "quantity": _field(med.get("quantity", {}).get("value") if isinstance(med.get("quantity"), dict) else med.get("quantity")),
+                    "directions_sig": _field(med.get("directions_sig", {}).get("value") if isinstance(med.get("directions_sig"), dict) else med.get("directions_sig")),
+                }
+                for fk in med_item:
+                    if fk in med and isinstance(med[fk], dict) and "confidence" in med[fk]:
+                        med_item[fk]["confidence"] = med[fk]["confidence"]
+                extraction["medications"].append(med_item)
+
+        # Fallback to single medication format if returned
+        elif "prescription_details" in parsed and "drug_name" in parsed["prescription_details"]:
+            old_details = parsed["prescription_details"]
+            med_item = {
+                "drug_name": _field(old_details.get("drug_name", {}).get("value") if isinstance(old_details.get("drug_name"), dict) else old_details.get("drug_name")),
+                "strength": _field(old_details.get("strength", {}).get("value") if isinstance(old_details.get("strength"), dict) else old_details.get("strength")),
+                "dosage_form": _field(old_details.get("dosage_form", {}).get("value") if isinstance(old_details.get("dosage_form"), dict) else old_details.get("dosage_form")),
+                "quantity": _field(old_details.get("quantity", {}).get("value") if isinstance(old_details.get("quantity"), dict) else old_details.get("quantity")),
+                "directions_sig": _field(old_details.get("directions_sig", {}).get("value") if isinstance(old_details.get("directions_sig"), dict) else old_details.get("directions_sig")),
+            }
+            for fk in med_item:
+                if fk in old_details and isinstance(old_details[fk], dict) and "confidence" in old_details[fk]:
+                    med_item[fk]["confidence"] = old_details[fk]["confidence"]
+            extraction["medications"].append(med_item)
+
+    except Exception:
+        pass
+
+    # Fallback to OCR text parsing if list is still empty
+    if not extraction["medications"]:
+        drugs = []
+        for line in ocr_text.split("\n"):
+            m = re.search(r'\b(tab\.|cap\.|syp\.|inj\.)\s+([a-z0-9\-\s\+]+)', line, re.I)
+            if m:
+                drugs.append(m.group(0).strip())
+        if not drugs:
+            drug_guess = clean_prediction(ocr_text)
+            if drug_guess:
+                drugs.append(drug_guess)
+        for d in drugs:
+            extraction["medications"].append({
+                "drug_name": _field(d, 0.3),
+                "strength": _field(None, 0.0),
+                "dosage_form": _field(None, 0.0),
+                "quantity": _field(None, 0.0),
+                "directions_sig": _field(None, 0.0),
+            })
+
+    # Apply controlled substance check on all medications
+    for med in extraction["medications"]:
+        drug_val = med["drug_name"].get("value")
+        if drug_val and is_controlled_substance(drug_val):
+            extraction["document_metadata"]["is_controlled_substance"] = True
 
     # Fallback legibility calculation if overall_legibility_score is 0.0
     metadata = extraction.setdefault("document_metadata", {})
@@ -1164,48 +1295,128 @@ def analyze_prescription(image, progress=gr.Progress()):
     progress(0.45, desc="Nemotron structuring extracted text into clinical JSON...")
     extraction = structure_ocr_with_nemotron(ocr_text)
 
-    # Step 4: Retrieval
-    progress(0.65, desc="Retrieval search over medicine aliases...")
-    drug_name = get_field_value(extraction, "prescription_details", "drug_name") or clean_prediction(ocr_text)
-    strength_hint = get_field_value(extraction, "prescription_details", "strength")
-    medicine, candidates, display_name, confidence = find_medicine_from_ocr(drug_name, strength_hint)
+    # Step 4: Retrieval & Step 5: Validation (for each medication)
+    progress(0.65, desc="Retrieval & validation of all medications...")
+    
+    medications = extraction.get("medications", [])
+    if not medications:
+        medications = [{
+            "drug_name": _field(clean_prediction(ocr_text), 0.3),
+            "strength": _field(None, 0.0),
+            "dosage_form": _field(None, 0.0),
+            "quantity": _field(None, 0.0),
+            "directions_sig": _field(None, 0.0)
+        }]
 
-    # Step 5: Validation
-    progress(0.80, desc="Nemotron validating prescription...")
-    plan = validate_with_nemotron(ocr_text, extraction, medicine, display_name, confidence, candidates)
+    med_results = []
+    for i, med_data in enumerate(medications):
+        dname = med_data["drug_name"].get("value") or "Unknown"
+        s_hint = med_data["strength"].get("value")
+        
+        # Retrieval
+        medicine, candidates, display_name, confidence = find_medicine_from_ocr(dname, s_hint)
+        
+        # Build temp extraction for validation of this specific drug
+        temp_extraction = {
+            **extraction,
+            "prescription_details": {
+                "date_of_issuance": extraction["prescription_details"].get("date_of_issuance", _field()),
+                "drug_name": med_data["drug_name"],
+                "strength": med_data["strength"],
+                "dosage_form": med_data["dosage_form"],
+                "quantity": med_data["quantity"],
+                "directions_sig": med_data["directions_sig"],
+                "refills_authorized": extraction["prescription_details"].get("refills_authorized", _field()),
+                "dispense_as_written": extraction["prescription_details"].get("dispense_as_written", _field(None)),
+            }
+        }
+        
+        # Validation
+        plan = validate_with_nemotron(ocr_text, temp_extraction, medicine, display_name, confidence, candidates)
+        
+        accepted = plan.get("status") == "validated" and confidence >= ACCEPTANCE_THRESHOLD
+        inventory = get_inventory(medicine)
+        
+        med_results.append({
+            "drug_name": dname,
+            "display_name": display_name,
+            "medicine": medicine,
+            "candidates": candidates,
+            "confidence": confidence,
+            "plan": plan,
+            "inventory": inventory,
+            "accepted": accepted,
+            "ocr_text": ocr_text,
+        })
+        
     unload_nemotron_model()
-
     progress(1.00, desc="Result prepared")
 
-    accepted = plan.get("status") == "validated" and confidence >= ACCEPTANCE_THRESHOLD
-    inventory = get_inventory(medicine)
-    image_path = resolve_asset_path(medicine.get("image_path"))
-    package_image_val = str(image_path) if image_path and accepted else None
-
+    active_idx = 0
+    active = med_results[active_idx]
+    
+    image_path = resolve_asset_path(active["medicine"].get("image_path"))
+    package_image_val = str(image_path) if image_path and active["accepted"] else None
+    
     state = {
-        "medicine_id": medicine["id"],
-        "medicine_name": medicine["name"],
-        "display_name": display_name,
-        "accepted": accepted,
-        "shelf": inventory["shelf"],
-        "row": inventory["row"],
+        "medications": med_results,
+        "active_index": active_idx,
+        "patient_info": extraction.get("patient_info"),
+        "prescriber_info": extraction.get("prescriber_info"),
+        "document_metadata": extraction.get("document_metadata")
     }
     SESSION_SEARCHES += 1
+    
+    choices = [f"{idx+1}. {m['drug_name']} ({m['display_name']})" for idx, m in enumerate(med_results)]
 
     return (
         load_kpi_metrics(SESSION_SEARCHES),
-        pipeline_html(5, plan.get("status", "needs_review")),
+        pipeline_html(5, active["plan"].get("status", "needs_review")),
         compliance_banner_html(extraction),
         extraction_card_html(extraction),
-        medicine_details_html(medicine, inventory, ocr_text, display_name, confidence, plan),
+        medicine_details_html(active["medicine"], active["inventory"], ocr_text, active["display_name"], active["confidence"], active["plan"]),
         package_image_val,
-        package_status_html(inventory, accepted),
-        confidence_gauge(confidence),
-        candidates_html(candidates),
-        ocr_compare_html(medicine, ocr_text, display_name, confidence, plan),
-        translated_prescription_html(plan),
+        package_status_html(active["inventory"], active["accepted"]),
+        confidence_gauge(active["confidence"]),
+        candidates_html(active["candidates"]),
+        ocr_compare_html(active["medicine"], ocr_text, active["display_name"], active["confidence"], active["plan"]),
+        translated_prescription_html(active["plan"]),
         gr.update(visible=True),
-        gr.update(visible=True, interactive=accepted),
+        gr.update(visible=True, interactive=active["accepted"]),
+        gr.update(choices=choices, value=choices[active_idx], visible=len(choices) > 1),
+        state,
+    )
+
+
+def select_medication(selected_label: str, state: dict[str, Any] | None):
+    if not state or "medications" not in state:
+        return [gr.update() for _ in range(9)]
+        
+    active_idx = 0
+    for i, m in enumerate(state["medications"]):
+        label = f"{i+1}. {m['drug_name']} ({m['display_name']})"
+        if label == selected_label:
+            active_idx = i
+            break
+            
+    state["active_index"] = active_idx
+    active = state["medications"][active_idx]
+    
+    image_path = resolve_asset_path(active["medicine"].get("image_path"))
+    package_image_val = str(image_path) if image_path and active["accepted"] else None
+    
+    inventory = active["inventory"]
+    ocr_text = active.get("ocr_text", "")
+    
+    return (
+        medicine_details_html(active["medicine"], inventory, ocr_text, active["display_name"], active["confidence"], active["plan"]),
+        package_image_val,
+        package_status_html(inventory, active["accepted"]),
+        confidence_gauge(active["confidence"]),
+        candidates_html(active["candidates"]),
+        ocr_compare_html(active["medicine"], ocr_text, active["display_name"], active["confidence"], active["plan"]),
+        translated_prescription_html(active["plan"]),
+        gr.update(visible=True, interactive=active["accepted"]),
         state,
     )
 
@@ -1213,7 +1424,9 @@ def analyze_prescription(image, progress=gr.Progress()):
 def open_locator(state: dict[str, Any] | None):
     if not state:
         raise gr.Error("Analyze a prescription before opening the shelf scanner.")
-    return gr.update(visible=True), f"Opening shelf scanner for {state['display_name']} on shelf {state['shelf']}."
+    active_idx = state.get("active_index", 0)
+    active = state["medications"][active_idx]
+    return gr.update(visible=True), f"Opening shelf scanner for {active['display_name']} on shelf {active['shelf']}."
 
 
 def locate_on_shelf(shelf_image, state: dict[str, Any] | None):
@@ -1221,6 +1434,9 @@ def locate_on_shelf(shelf_image, state: dict[str, Any] | None):
         raise gr.Error("Analyze a prescription before locating a medicine.")
     if shelf_image is None:
         raise gr.Error("Upload or capture a shelf image first.")
+
+    active_idx = state.get("active_index", 0)
+    active = state["medications"][active_idx]
 
     image = shelf_image.convert("RGB")
     width, height = image.size
@@ -1237,16 +1453,16 @@ def locate_on_shelf(shelf_image, state: dict[str, Any] | None):
             outline="#10b981",
         )
     draw.rectangle((box[0], max(0, box[1] - 34), box[2], box[1]), fill="#10b981")
-    draw.text((box[0] + 10, max(2, box[1] - 27)), state["display_name"], fill="white")
+    draw.text((box[0] + 10, max(2, box[1] - 27)), active["display_name"], fill="white")
 
     info = f"""
     <div class="result-card compact">
       <h3>Shelf Result</h3>
       <dl class="details">
-        <dt>Found</dt><dd>{state['display_name']}</dd>
-        <dt>Canonical</dt><dd>{state['medicine_name']}</dd>
-        <dt>Shelf</dt><dd>{state['shelf']}</dd>
-        <dt>Row</dt><dd>{state['row']}</dd>
+        <dt>Found</dt><dd>{active['display_name']}</dd>
+        <dt>Canonical</dt><dd>{active['medicine']['name']}</dd>
+        <dt>Shelf</dt><dd>{active['shelf']}</dd>
+        <dt>Row</dt><dd>{active['row']}</dd>
         <dt>Confidence</dt><dd>95%</dd>
       </dl>
     </div>
@@ -1606,6 +1822,12 @@ with gr.Blocks(title="PharmaCopilot") as demo:
 
     with gr.Group(visible=False, elem_classes=["app-shell"]) as result_section:
         gr.Markdown("## Prescription Analysis Result")
+        medication_select = gr.Dropdown(
+            label="Select Medication to View/Verify",
+            choices=[],
+            interactive=True,
+            visible=False,
+        )
         compliance_banner = gr.HTML()
         extraction_card = gr.HTML()
         with gr.Row():
@@ -1654,6 +1876,22 @@ with gr.Blocks(title="PharmaCopilot") as demo:
             comparison,
             translated_prescription,
             result_section,
+            locate_btn,
+            medication_select,
+            state,
+        ],
+    )
+    medication_select.change(
+        select_medication,
+        inputs=[medication_select, state],
+        outputs=[
+            details,
+            package_image,
+            stock,
+            gauge,
+            candidates,
+            comparison,
+            translated_prescription,
             locate_btn,
             state,
         ],

@@ -92,47 +92,57 @@ def is_controlled_substance(drug_name: str) -> bool:
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 # Pass 1: MiniCPM-V reads ALL text from the prescription image
-FULL_OCR_PROMPT = """You are an OCR engine for medical prescriptions.
+FULL_OCR_PROMPT = """You are a medical prescription OCR engine. This prescription may contain text in multiple scripts (e.g., Bengali, Hindi, Arabic, English). Your job is to read and transcribe ALL text.
 
-Read ALL text visible in this prescription image. Include everything:
-- Printed headers, clinic names, hospital names, logo text
-- Patient information: name, address, date of birth, phone number
-- Prescriber/Doctor information: name, credentials, address, DEA number, NPI number, phone number, signature presence
-- Date of the prescription
-- ALL drug/medication names with their strengths and dosage forms
-- Directions for use (Sig) exactly as written - do NOT translate abbreviations
-- Quantity prescribed (numeric and written)
-- Number of refills authorized
-- Whether "Dispense As Written" or "No Substitution" is checked
-- Any other stamps, markings, or text
+PRIORITY ORDER — read these sections first:
+1. HANDWRITTEN CONTENT: Drug names (Tab., Cap., Inj., Syp.), dosages (mg, ml), frequencies (1+0+1, BD, TDS), durations
+2. Patient name and age/date of birth (often near top, after "Name:" or similar)
+3. Date of prescription
+4. Doctor/Prescriber name and credentials (often printed at top or stamped at bottom)
+5. Clinic/Hospital name, address, phone numbers
+6. Any other printed or stamped text
 
-Rules:
-- Output ALL text exactly as written on the prescription
-- Preserve the layout structure using line breaks
-- Do NOT interpret, correct spelling, or translate medical abbreviations
-- If text is illegible, write [ILLEGIBLE] in its place
-- If a section appears to be a signature, note it as [SIGNATURE PRESENT]
-- Include field labels (e.g., "Patient:", "Rx:", "Sig:") if visible
+OUTPUT FORMAT — structure your output like this:
+DOCTOR: [doctor name and credentials]
+CLINIC: [clinic/hospital name and address]
+PATIENT: [patient name]
+DATE: [prescription date]
+Rx:
+1) [drug name] [strength] — [frequency/dosage instructions]
+2) [drug name] [strength] — [frequency/dosage instructions]
+...
+ADVICE: [any additional instructions, follow-up notes]
+SIGNATURE: [PRESENT/NOT VISIBLE]
 
-Return the complete text extraction now."""
+CRITICAL RULES:
+- Drug names are almost always written in English/Latin script (e.g., Tab. Diclofenac, Cap. Omeprazole) even on non-English prescriptions. READ THEM CAREFULLY.
+- Dosage patterns like "1+0+1", "2+0+2", "0+0+1" mean morning+afternoon+night doses
+- Transcribe EXACTLY as written — do NOT translate, correct spelling, or expand abbreviations
+- Read ALL numbered items (①, ②, ③ or 1), 2), 3) etc.)
+- If text is illegible, write [ILLEGIBLE]
+- Include ALL drugs — prescriptions often have 3-10 medications listed"""
 
 # Pass 2: Nemotron structures the raw OCR into the clinical JSON schema
 STRUCTURING_PROMPT_TEMPLATE = """You are a HIPAA-compliant Clinical Data Extraction Agent.
 
-You have been given raw OCR text extracted from a medical prescription image. Your task is to parse this text into a structured JSON format.
+You have been given raw OCR text extracted from a medical prescription image. Parse this text into structured JSON.
 
 STRICT RULES:
-1. ZERO HALLUCINATION: This is life-critical medical data. If a field is not found in the text, output null for its value. Do NOT guess or infer.
-2. NO CLINICAL TRANSLATION: Extract the Sig (directions) EXACTLY as written. Do not expand abbreviations.
-3. Assign a confidence_score (0.00 to 1.00) to every field based on how clearly it appeared in the OCR text.
-4. Determine if the drug is a Controlled Substance (DEA Schedules II-V).
+1. ZERO HALLUCINATION: If a field is not found, output null. Do NOT guess.
+2. NO CLINICAL TRANSLATION: Extract Sig/directions EXACTLY as written (e.g., "2+0+2", "1 tab PO BID"). Do NOT expand.
+3. Assign confidence (0.00 to 1.00) based on clarity in the OCR text.
+4. For drug_name: extract the FIRST/PRIMARY drug prescribed (e.g., "Tab. Diclofenac" → "Diclofenac"). If multiple drugs, use the first one.
+5. For directions_sig: include the dosage pattern (e.g., "2+0+2" or "1+0+1") and any duration mentioned.
+6. Dosage forms: Tab. = tablets, Cap. = capsules, Syp. = syrup, Inj. = injection, Susp. = suspension.
+7. Look for patient name after "Name:" or "নাম:" fields. Look for date after "Date:" or "তারিখ:".
+8. Doctor name is usually printed at the top or bottom of the prescription.
 
 RAW OCR TEXT:
 ---
 {ocr_text}
 ---
 
-Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):
+Return ONLY valid JSON (no markdown, no explanation):
 {{
   "document_metadata": {{
     "is_controlled_substance": false,

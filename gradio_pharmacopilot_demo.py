@@ -223,6 +223,22 @@ def normalize(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
+# Build a comprehensive lookup map: normalized name -> (original casing, medicine dict)
+NAME_TO_MED = {}
+for m in MEDICINES:
+    NAME_TO_MED[normalize(m["name"])] = (m["name"], m)
+    if m.get("generic_name"):
+        NAME_TO_MED[normalize(m["generic_name"])] = (m["generic_name"], m)
+    for brand in m.get("brand_names") or []:
+        NAME_TO_MED[normalize(brand)] = (brand, m)
+
+for brand, generic in BD_BRAND_TO_GENERIC.items():
+    norm_gen = normalize(generic)
+    res = NAME_TO_MED.get(norm_gen)
+    if res:
+        NAME_TO_MED[normalize(brand)] = (brand, res[1])
+
+
 def clean_prediction(raw_prediction: str) -> str:
     """Clean a raw OCR prediction for single-name extraction (legacy helper)."""
     text = str(raw_prediction or "").strip()
@@ -258,33 +274,23 @@ def label_for_medicine(ocr_text: str, medicine: dict[str, Any]) -> str:
 def find_medicine_from_ocr(ocr_text: str, strength_hint: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str, int]:
     """Find medicine from OCR text with optional strength disambiguation."""
     query = normalize(ocr_text)
-    corrected_query = query
-    canonical = BD_BRAND_TO_GENERIC.get(corrected_query, corrected_query)
-    direct_medicine = MED_BY_NAME.get(normalize(canonical))
 
-    candidate_names = set()
-    for med in MEDICINES:
-        candidate_names.add(med["name"])
-        candidate_names.add(med.get("generic_name") or med["name"])
-        candidate_names.update(med.get("brand_names") or [])
-    candidate_names.update(BD_BRAND_TO_GENERIC.keys())
+    # Direct lookup first
+    direct_res = NAME_TO_MED.get(query)
 
     scored = []
-    for name in candidate_names:
-        score = SequenceMatcher(None, query, normalize(name)).ratio()
+    for norm_name, (orig_name, med) in NAME_TO_MED.items():
+        score = SequenceMatcher(None, query, norm_name).ratio()
         if score > 0.35:
-            mapped = BD_BRAND_TO_GENERIC.get(normalize(name), normalize(name))
-            med = MED_BY_NAME.get(mapped) or MED_BY_NAME.get(normalize(name))
-            if med:
-                # Boost score if strength matches
-                if strength_hint and med.get("strength"):
-                    if normalize(strength_hint) in normalize(med["strength"]):
-                        score = min(1.0, score + 0.1)
-                scored.append({"label": name, "medicine": med, "score": score})
+            # Boost score if strength matches
+            if strength_hint and med.get("strength"):
+                if normalize(strength_hint) in normalize(med["strength"]):
+                    score = min(1.0, score + 0.1)
+            scored.append({"label": orig_name, "medicine": med, "score": score})
 
     scored.sort(key=lambda item: item["score"], reverse=True)
-    if direct_medicine:
-        medicine = direct_medicine
+    if direct_res:
+        medicine = direct_res[1]
         display_name = label_for_medicine(ocr_text, medicine)
         primary_score = 0.97
     elif scored:
@@ -311,10 +317,10 @@ def find_medicine_from_ocr(ocr_text: str, strength_hint: str | None = None) -> t
         fallback_name = get_close_matches(query, list(BD_BRAND_TO_GENERIC.keys()), n=1)
         if fallback_name:
             mapped = BD_BRAND_TO_GENERIC[fallback_name[0]]
-            med = MED_BY_NAME.get(mapped)
-            if med and med["id"] not in seen_ids:
-                top.append({"label": fallback_name[0], "medicine": med, "score": 0.62})
-                seen_ids.add(med["id"])
+            res = NAME_TO_MED.get(normalize(mapped))
+            if res and res[1]["id"] not in seen_ids:
+                top.append({"label": fallback_name[0], "medicine": res[1], "score": 0.62})
+                seen_ids.add(res[1]["id"])
                 continue
         break
 
@@ -431,6 +437,22 @@ def empty_extraction() -> dict[str, Any]:
     }
 
 
+def calculate_fallback_legibility(extraction: dict[str, Any]) -> float:
+    scores = []
+    for section_key in ("patient_info", "prescriber_info", "prescription_details"):
+        section = extraction.get(section_key, {})
+        for field_key, field in section.items():
+            if isinstance(field, dict):
+                val = field.get("value")
+                conf = field.get("confidence", 0.0)
+                # Only average fields that were actually detected and not false/empty
+                if val is not None and val != "" and val is not False:
+                    scores.append(conf)
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
+
+
 def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, Any]:
     """Parse Nemotron output into the structured extraction schema.
     Falls back gracefully if JSON is malformed."""
@@ -458,6 +480,12 @@ def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, 
     drug_val = extraction["prescription_details"]["drug_name"].get("value")
     if drug_val and is_controlled_substance(drug_val):
         extraction["document_metadata"]["is_controlled_substance"] = True
+
+    # Fallback legibility calculation if overall_legibility_score is 0.0
+    metadata = extraction.setdefault("document_metadata", {})
+    legibility = metadata.get("overall_legibility_score", 0.0)
+    if legibility == 0.0:
+        metadata["overall_legibility_score"] = calculate_fallback_legibility(extraction)
 
     return extraction
 

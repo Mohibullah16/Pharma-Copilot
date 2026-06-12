@@ -11,3 +11,4 @@ protobuf
 einops
 timm
 openai
+opencv-python-headless

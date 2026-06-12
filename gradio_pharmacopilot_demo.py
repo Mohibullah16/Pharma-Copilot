@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import unicodedata
 import time
 from difflib import SequenceMatcher, get_close_matches
@@ -50,19 +51,118 @@ BRAND_MAP_PATH = data_path("training/bd_brand_to_generic.json")
 INVENTORY_PATH = data_path("inventory.json")
 
 MODEL_ID = os.getenv("PHARMACOPILOT_MODEL_ID", "openbmb/MiniCPM-V-4_5")
-LIVE_GPU_OCR = os.getenv("PHARMACOPILOT_LIVE_GPU_OCR", "1").lower() not in {"0", "false", "no"}
-LIVE_NEMOTRON = os.getenv("PHARMACOPILOT_LIVE_NEMOTRON", "1").lower() not in {"0", "false", "no"}
 NEMOTRON_MODEL_ID = os.getenv("NEMOTRON_MODEL_ID", "nvidia/Nemotron-Mini-4B-Instruct")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 NVIDIA_NIM_MODEL = os.getenv("NVIDIA_NIM_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
-DEMO_OCR_TEXT = "Neuoxen"
-DEMO_PROMPT = "Read the handwritten medicine name in the image. Return only the text."
 ACCEPTANCE_THRESHOLD = int(os.getenv("PHARMACOPILOT_ACCEPTANCE_THRESHOLD", "75"))
 OCR_MODEL = None
 OCR_TOKENIZER = None
 NEMOTRON_MODEL = None
 NEMOTRON_TOKENIZER = None
+
+# ── Controlled substance lookup (DEA Schedules II-V) ─────────────────────────
+CONTROLLED_SUBSTANCES = {
+    # Schedule II
+    "oxycodone", "oxycontin", "hydrocodone", "vicodin", "morphine", "fentanyl",
+    "methadone", "amphetamine", "adderall", "dextroamphetamine", "methamphetamine",
+    "methylphenidate", "ritalin", "concerta", "codeine", "hydromorphone",
+    "meperidine", "demerol", "tapentadol", "lisdexamfetamine", "vyvanse",
+    # Schedule III
+    "testosterone", "ketamine", "buprenorphine", "suboxone", "anabolic steroids",
+    # Schedule IV
+    "alprazolam", "xanax", "diazepam", "valium", "lorazepam", "ativan",
+    "clonazepam", "klonopin", "zolpidem", "ambien", "tramadol", "carisoprodol",
+    "midazolam", "temazepam", "triazolam", "phenobarbital",
+    # Schedule V
+    "pregabalin", "lyrica", "lacosamide", "ezogabine",
+}
+
+
+def is_controlled_substance(drug_name: str) -> bool:
+    """Check if a drug name matches a known controlled substance."""
+    if not drug_name:
+        return False
+    normalized = drug_name.strip().lower()
+    for substance in CONTROLLED_SUBSTANCES:
+        if substance in normalized or normalized in substance:
+            return True
+    return False
+
+
+# ── Prompts ──────────────────────────────────────────────────────────────────
+# Pass 1: MiniCPM-V reads ALL text from the prescription image
+FULL_OCR_PROMPT = """You are an OCR engine for medical prescriptions.
+
+Read ALL text visible in this prescription image. Include everything:
+- Printed headers, clinic names, hospital names, logo text
+- Patient information: name, address, date of birth, phone number
+- Prescriber/Doctor information: name, credentials, address, DEA number, NPI number, phone number, signature presence
+- Date of the prescription
+- ALL drug/medication names with their strengths and dosage forms
+- Directions for use (Sig) exactly as written - do NOT translate abbreviations
+- Quantity prescribed (numeric and written)
+- Number of refills authorized
+- Whether "Dispense As Written" or "No Substitution" is checked
+- Any other stamps, markings, or text
+
+Rules:
+- Output ALL text exactly as written on the prescription
+- Preserve the layout structure using line breaks
+- Do NOT interpret, correct spelling, or translate medical abbreviations
+- If text is illegible, write [ILLEGIBLE] in its place
+- If a section appears to be a signature, note it as [SIGNATURE PRESENT]
+- Include field labels (e.g., "Patient:", "Rx:", "Sig:") if visible
+
+Return the complete text extraction now."""
+
+# Pass 2: Nemotron structures the raw OCR into the clinical JSON schema
+STRUCTURING_PROMPT_TEMPLATE = """You are a HIPAA-compliant Clinical Data Extraction Agent.
+
+You have been given raw OCR text extracted from a medical prescription image. Your task is to parse this text into a structured JSON format.
+
+STRICT RULES:
+1. ZERO HALLUCINATION: This is life-critical medical data. If a field is not found in the text, output null for its value. Do NOT guess or infer.
+2. NO CLINICAL TRANSLATION: Extract the Sig (directions) EXACTLY as written. Do not expand abbreviations.
+3. Assign a confidence_score (0.00 to 1.00) to every field based on how clearly it appeared in the OCR text.
+4. Determine if the drug is a Controlled Substance (DEA Schedules II-V).
+
+RAW OCR TEXT:
+---
+{ocr_text}
+---
+
+Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):
+{{
+  "document_metadata": {{
+    "is_controlled_substance": false,
+    "overall_legibility_score": 0.0
+  }},
+  "patient_info": {{
+    "name": {{ "value": null, "confidence": 0.0 }},
+    "address": {{ "value": null, "confidence": 0.0 }},
+    "date_of_birth": {{ "value": null, "confidence": 0.0 }},
+    "phone_number": {{ "value": null, "confidence": 0.0 }}
+  }},
+  "prescriber_info": {{
+    "name": {{ "value": null, "confidence": 0.0 }},
+    "signature_present": {{ "value": false, "confidence": 0.0 }},
+    "address": {{ "value": null, "confidence": 0.0 }},
+    "dea_number": {{ "value": null, "confidence": 0.0 }},
+    "npi_number": {{ "value": null, "confidence": 0.0 }},
+    "phone_number": {{ "value": null, "confidence": 0.0 }}
+  }},
+  "prescription_details": {{
+    "date_of_issuance": {{ "value": null, "confidence": 0.0 }},
+    "drug_name": {{ "value": null, "confidence": 0.0 }},
+    "strength": {{ "value": null, "confidence": 0.0 }},
+    "dosage_form": {{ "value": null, "confidence": 0.0 }},
+    "quantity": {{ "value": null, "confidence": 0.0 }},
+    "directions_sig": {{ "value": null, "confidence": 0.0 }},
+    "refills_authorized": {{ "value": null, "confidence": 0.0 }},
+    "dispense_as_written": {{ "value": null, "confidence": 0.0 }}
+  }}
+}}"""
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -109,6 +209,7 @@ def normalize(text: str) -> str:
 
 
 def clean_prediction(raw_prediction: str) -> str:
+    """Clean a raw OCR prediction for single-name extraction (legacy helper)."""
     text = str(raw_prediction or "").strip()
     text = text.replace("\r", "\n")
     text = text.split("\n")[0].strip() if "\n" in text else text
@@ -139,7 +240,8 @@ def label_for_medicine(ocr_text: str, medicine: dict[str, Any]) -> str:
     return brands[0] if brands else medicine["name"]
 
 
-def find_medicine_from_ocr(ocr_text: str) -> tuple[dict[str, Any], list[dict[str, Any]], str, int]:
+def find_medicine_from_ocr(ocr_text: str, strength_hint: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], str, int]:
+    """Find medicine from OCR text with optional strength disambiguation."""
     query = normalize(ocr_text)
     corrected_query = query
     canonical = BD_BRAND_TO_GENERIC.get(corrected_query, corrected_query)
@@ -159,6 +261,10 @@ def find_medicine_from_ocr(ocr_text: str) -> tuple[dict[str, Any], list[dict[str
             mapped = BD_BRAND_TO_GENERIC.get(normalize(name), normalize(name))
             med = MED_BY_NAME.get(mapped) or MED_BY_NAME.get(normalize(name))
             if med:
+                # Boost score if strength matches
+                if strength_hint and med.get("strength"):
+                    if normalize(strength_hint) in normalize(med["strength"]):
+                        score = min(1.0, score + 0.1)
                 scored.append({"label": name, "medicine": med, "score": score})
 
     scored.sort(key=lambda item: item["score"], reverse=True)
@@ -172,7 +278,7 @@ def find_medicine_from_ocr(ocr_text: str) -> tuple[dict[str, Any], list[dict[str
         display_name = best["label"]
         primary_score = best["score"]
     else:
-        medicine = MEDICINES[0]
+        medicine = MEDICINES[0] if MEDICINES else {"id": "unknown", "name": "Unknown"}
         display_name = clean_prediction(ocr_text) or "Needs review"
         primary_score = 0.0
 
@@ -279,19 +385,99 @@ def extract_json_object(text: str) -> dict[str, Any]:
     return json.loads(cleaned)
 
 
+# ── Structured Extraction Parsing ────────────────────────────────────────────
+
+def _field(value: Any = None, confidence: float = 0.0) -> dict:
+    return {"value": value, "confidence": confidence}
+
+
+def empty_extraction() -> dict[str, Any]:
+    """Return a blank extraction schema."""
+    return {
+        "document_metadata": {
+            "is_controlled_substance": False,
+            "overall_legibility_score": 0.0,
+        },
+        "patient_info": {
+            "name": _field(), "address": _field(),
+            "date_of_birth": _field(), "phone_number": _field(),
+        },
+        "prescriber_info": {
+            "name": _field(), "signature_present": _field(False),
+            "address": _field(), "dea_number": _field(),
+            "npi_number": _field(), "phone_number": _field(),
+        },
+        "prescription_details": {
+            "date_of_issuance": _field(), "drug_name": _field(),
+            "strength": _field(), "dosage_form": _field(),
+            "quantity": _field(), "directions_sig": _field(),
+            "refills_authorized": _field(), "dispense_as_written": _field(None),
+        },
+    }
+
+
+def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, Any]:
+    """Parse Nemotron output into the structured extraction schema.
+    Falls back gracefully if JSON is malformed."""
+    extraction = empty_extraction()
+    try:
+        parsed = extract_json_object(raw_text)
+        # Merge parsed data into extraction, preserving schema structure
+        if "document_metadata" in parsed:
+            extraction["document_metadata"].update(parsed["document_metadata"])
+        for section in ("patient_info", "prescriber_info", "prescription_details"):
+            if section in parsed:
+                for key, val in parsed[section].items():
+                    if key in extraction[section]:
+                        if isinstance(val, dict) and "value" in val:
+                            extraction[section][key] = val
+                        else:
+                            extraction[section][key] = _field(val, 0.5)
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # Fallback: try to extract drug name from raw text
+        drug_guess = clean_prediction(ocr_text or raw_text)
+        if drug_guess:
+            extraction["prescription_details"]["drug_name"] = _field(drug_guess, 0.3)
+
+    # Apply controlled substance check using our lookup
+    drug_val = extraction["prescription_details"]["drug_name"].get("value")
+    if drug_val and is_controlled_substance(drug_val):
+        extraction["document_metadata"]["is_controlled_substance"] = True
+
+    return extraction
+
+
+def get_field_value(extraction: dict, section: str, field: str) -> Any:
+    """Safely get a field value from the extraction dict."""
+    return extraction.get(section, {}).get(field, {}).get("value")
+
+
+def get_field_confidence(extraction: dict, section: str, field: str) -> float:
+    """Safely get a field confidence from the extraction dict."""
+    return extraction.get(section, {}).get(field, {}).get("confidence", 0.0)
+
+
+# ── Validation Prompt (enhanced) ─────────────────────────────────────────────
+
 def build_validation_prompt(
     ocr_text: str,
+    extraction: dict[str, Any],
     medicine: dict[str, Any],
     display_name: str,
     confidence: int,
     retrieval_candidates: list[dict[str, Any]],
 ) -> str:
     validation_payload = {
-        "ocr_text": ocr_text,
+        "raw_ocr_text": ocr_text,
+        "extracted_drug_name": get_field_value(extraction, "prescription_details", "drug_name"),
+        "extracted_strength": get_field_value(extraction, "prescription_details", "strength"),
+        "extracted_sig": get_field_value(extraction, "prescription_details", "directions_sig"),
+        "extracted_quantity": get_field_value(extraction, "prescription_details", "quantity"),
+        "is_controlled_substance": extraction.get("document_metadata", {}).get("is_controlled_substance", False),
         "retrieved_display_name": display_name,
         "retrieved_canonical_name": medicine.get("name", "Unknown"),
         "retrieval_confidence": confidence,
-        "strength": first_strength(medicine.get("strength", "")),
+        "retrieved_strength": first_strength(medicine.get("strength", "")),
         "category": medicine.get("category", "Unknown"),
         "top_candidates": [
             {
@@ -302,17 +488,31 @@ def build_validation_prompt(
             for item in retrieval_candidates[:3]
         ],
     }
-    return f"""
-You are a pharmacy prescription validation assistant.
+
+    # Check for compliance issues
+    compliance_flags = []
+    is_controlled = extraction.get("document_metadata", {}).get("is_controlled_substance", False)
+    if is_controlled:
+        if not get_field_value(extraction, "patient_info", "address"):
+            compliance_flags.append("MISSING_PATIENT_ADDRESS_FOR_CONTROLLED")
+        if not get_field_value(extraction, "prescriber_info", "address"):
+            compliance_flags.append("MISSING_PRESCRIBER_ADDRESS_FOR_CONTROLLED")
+        if not get_field_value(extraction, "prescriber_info", "dea_number"):
+            compliance_flags.append("MISSING_DEA_NUMBER_FOR_CONTROLLED")
+    validation_payload["compliance_flags"] = compliance_flags
+
+    return f"""You are a pharmacy prescription validation assistant.
 
 Input JSON:
 {json.dumps(validation_payload, ensure_ascii=False)}
 
 Task:
-1. Decide whether the retrieved medicine is safe to accept.
+1. Decide whether the retrieved medicine is safe to accept based on the OCR extraction and retrieval match.
 2. Translate the prescription into a clean pharmacy instruction row.
-3. Do not invent dose/timing/duration if it is not visible or inferable.
+3. Do NOT invent dose/timing/duration if not visible in the extracted data.
 4. If OCR and retrieved medicine clearly disagree, return needs_review.
+5. If this is a controlled substance and mandatory fields are missing, note it in validation_note.
+6. Check if extracted strength matches retrieved medicine strength.
 
 Return ONLY valid JSON with these keys:
 status: one of validated, needs_review
@@ -326,6 +526,7 @@ duration
 instructions
 validation_note
 ocr_text
+flags: list of any compliance or safety flags
 """
 
 
@@ -353,7 +554,7 @@ def validate_with_nvidia_nim(
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             top_p=1,
-            max_tokens=320,
+            max_tokens=512,
         )
         content = response.choices[0].message.content or ""
         plan = extract_json_object(content)
@@ -384,8 +585,88 @@ def validate_with_nvidia_nim(
         )
 
 
+def run_nemotron_inference(prompt: str) -> str:
+    """Run Nemotron inference locally, returning the raw generated text."""
+    global NEMOTRON_MODEL, NEMOTRON_TOKENIZER
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if NEMOTRON_MODEL is None or NEMOTRON_TOKENIZER is None:
+        NEMOTRON_TOKENIZER = AutoTokenizer.from_pretrained(NEMOTRON_MODEL_ID, trust_remote_code=True)
+        NEMOTRON_MODEL = AutoModelForCausalLM.from_pretrained(
+            NEMOTRON_MODEL_ID,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        ).eval()
+
+    messages = [{"role": "user", "content": prompt}]
+    if hasattr(NEMOTRON_TOKENIZER, "apply_chat_template"):
+        input_ids = NEMOTRON_TOKENIZER.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+    else:
+        input_ids = NEMOTRON_TOKENIZER(prompt, return_tensors="pt").input_ids
+
+    device = next(NEMOTRON_MODEL.parameters()).device
+    input_ids = input_ids.to(device)
+    with torch.inference_mode():
+        output_ids = NEMOTRON_MODEL.generate(
+            input_ids,
+            do_sample=False,
+            temperature=0.0,
+            top_p=1.0,
+            max_new_tokens=1024,
+            pad_token_id=NEMOTRON_TOKENIZER.eos_token_id,
+        )
+    generated = output_ids[0][input_ids.shape[-1]:]
+    return NEMOTRON_TOKENIZER.decode(generated, skip_special_tokens=True).strip()
+
+
+def run_nemotron_nim_inference(prompt: str) -> str:
+    """Run Nemotron inference via NVIDIA NIM API, returning raw text."""
+    from openai import OpenAI
+    client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_API_KEY)
+    response = client.chat.completions.create(
+        model=NVIDIA_NIM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        top_p=1,
+        max_tokens=1024,
+    )
+    return response.choices[0].message.content or ""
+
+
+def structure_ocr_with_nemotron(ocr_text: str) -> dict[str, Any]:
+    """Pass 2: Use Nemotron to structure raw OCR text into the clinical JSON schema."""
+    prompt = STRUCTURING_PROMPT_TEMPLATE.format(ocr_text=ocr_text)
+    try:
+        content = run_nemotron_inference(prompt)
+        return parse_structured_extraction(content, ocr_text)
+    except Exception as exc_local:
+        # Fallback to NVIDIA NIM API
+        if NVIDIA_API_KEY:
+            try:
+                content = run_nemotron_nim_inference(prompt)
+                return parse_structured_extraction(content, ocr_text)
+            except Exception:
+                pass
+        # Last resort: return extraction with just the drug name parsed from OCR
+        extraction = empty_extraction()
+        drug_guess = clean_prediction(ocr_text)
+        if drug_guess:
+            extraction["prescription_details"]["drug_name"] = _field(drug_guess, 0.3)
+            if is_controlled_substance(drug_guess):
+                extraction["document_metadata"]["is_controlled_substance"] = True
+        extraction["document_metadata"]["overall_legibility_score"] = 0.2
+        return extraction
+
+
 def validate_with_nemotron(
     ocr_text: str,
+    extraction: dict[str, Any],
     medicine: dict[str, Any],
     display_name: str,
     confidence: int,
@@ -393,48 +674,9 @@ def validate_with_nemotron(
 ) -> dict[str, Any]:
     global NEMOTRON_MODEL, NEMOTRON_TOKENIZER
 
-    if not LIVE_NEMOTRON:
-        return fallback_prescription_plan(
-            ocr_text, medicine, display_name, confidence, "Local Nemotron validation is disabled"
-        )
-
-    prompt = build_validation_prompt(ocr_text, medicine, display_name, confidence, retrieval_candidates)
+    prompt = build_validation_prompt(ocr_text, extraction, medicine, display_name, confidence, retrieval_candidates)
     try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        if NEMOTRON_MODEL is None or NEMOTRON_TOKENIZER is None:
-            NEMOTRON_TOKENIZER = AutoTokenizer.from_pretrained(NEMOTRON_MODEL_ID, trust_remote_code=True)
-            NEMOTRON_MODEL = AutoModelForCausalLM.from_pretrained(
-                NEMOTRON_MODEL_ID,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-            ).eval()
-
-        messages = [{"role": "user", "content": prompt}]
-        if hasattr(NEMOTRON_TOKENIZER, "apply_chat_template"):
-            input_ids = NEMOTRON_TOKENIZER.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-        else:
-            input_ids = NEMOTRON_TOKENIZER(prompt, return_tensors="pt").input_ids
-
-        device = next(NEMOTRON_MODEL.parameters()).device
-        input_ids = input_ids.to(device)
-        with torch.inference_mode():
-            output_ids = NEMOTRON_MODEL.generate(
-                input_ids,
-                do_sample=False,
-                temperature=0.0,
-                top_p=1.0,
-                max_new_tokens=320,
-                pad_token_id=NEMOTRON_TOKENIZER.eos_token_id,
-            )
-        generated = output_ids[0][input_ids.shape[-1] :]
-        content = NEMOTRON_TOKENIZER.decode(generated, skip_special_tokens=True).strip()
+        content = run_nemotron_inference(prompt)
         plan = extract_json_object(content)
         if plan.get("status") not in {"validated", "needs_review"}:
             plan["status"] = "needs_review"
@@ -474,7 +716,6 @@ def load_kpi_metrics(searches: int = 0) -> str:
     elif fallback_path.exists():
         text = fallback_path.read_text(encoding="utf-8", errors="ignore")
         if "ocr_accuracy" in text:
-            # Keep a conservative fallback tied to the checked-in report values.
             ocr_accuracy = 0.37888446215139443
             retrieval_accuracy = 0.6055776892430279
 
@@ -530,10 +771,10 @@ def pipeline_html(stage: int = 0, validation_status: str = "waiting") -> str:
     }.get(validation_status, "Nemotron Review")
     steps = [
         ("Prescription", "uploaded"),
-        ("MiniCPM OCR", "ran on image"),
+        ("MiniCPM OCR", "full text extraction"),
+        ("Nemotron Parse", "structured JSON"),
         ("Retrieval Engine", "ranked candidates"),
         (validation_label, "returned a decision"),
-        ("Pharmacy View", "prepared"),
     ]
     cards = []
     logs = []
@@ -581,7 +822,7 @@ def medicine_details_html(
     )
     return f"""
     <div class="result-card">
-      <h3>Prescription Details</h3>
+      <h3>Medicine Match</h3>
       <dl class="details">
         <dt>Medicine</dt><dd>{medicine_label}</dd>
         <dt>Generic</dt><dd>{generic_label}</dd>
@@ -593,13 +834,118 @@ def medicine_details_html(
       </dl>
       <div class="explain">
         <h4>AI Explanation</h4>
-        <p><b>OCR detected:</b> "{ocr_text}"</p>
+        <p><b>OCR detected:</b> \"{ocr_text[:200]}{'...' if len(ocr_text) > 200 else ''}\"</p>
         <p><b>Retrieved:</b> {display_name} ({medicine.get('name', 'Unknown')})</p>
         <p><b>Validation:</b> {validation_label}</p>
         <p><b>Inventory:</b> {inventory_label}</p>
       </div>
     </div>
     """
+
+
+def _confidence_badge(conf: float) -> str:
+    """Return a colored confidence badge."""
+    if conf >= 0.85:
+        color, bg = "#065f46", "#d1fae5"
+    elif conf >= 0.50:
+        color, bg = "#92400e", "#fef3c7"
+    elif conf > 0:
+        color, bg = "#991b1b", "#fee2e2"
+    else:
+        color, bg = "#6b7280", "#f3f4f6"
+    pct = f"{conf * 100:.0f}%"
+    return f'<span style="background:{bg};color:{color};padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700;">{pct}</span>'
+
+
+def _display_value(val: Any) -> str:
+    """Format a field value for display."""
+    if val is None:
+        return '<span style="color:#9ca3af;font-style:italic;">Not detected</span>'
+    if isinstance(val, bool):
+        return "Yes" if val else "No"
+    return str(val)
+
+
+def extraction_card_html(extraction: dict[str, Any]) -> str:
+    """Build the full structured extraction card showing all extracted fields."""
+    sections = [
+        ("Patient Information", "patient_info", [
+            ("Name", "name"), ("Address", "address"),
+            ("Date of Birth", "date_of_birth"), ("Phone", "phone_number"),
+        ]),
+        ("Prescriber Information", "prescriber_info", [
+            ("Name", "name"), ("Signature Present", "signature_present"),
+            ("Address", "address"), ("DEA Number", "dea_number"),
+            ("NPI Number", "npi_number"), ("Phone", "phone_number"),
+        ]),
+        ("Prescription Details", "prescription_details", [
+            ("Date Issued", "date_of_issuance"), ("Drug Name", "drug_name"),
+            ("Strength", "strength"), ("Dosage Form", "dosage_form"),
+            ("Quantity", "quantity"), ("Directions (Sig)", "directions_sig"),
+            ("Refills", "refills_authorized"), ("Dispense As Written", "dispense_as_written"),
+        ]),
+    ]
+
+    legibility = extraction.get("document_metadata", {}).get("overall_legibility_score", 0)
+    html_parts = [f'<div class="extraction-card">']
+    html_parts.append(f'<div class="extraction-header"><h3>Full Prescription Extraction</h3>')
+    html_parts.append(f'<span class="legibility-badge">Legibility: {_confidence_badge(legibility)}</span></div>')
+
+    for section_title, section_key, fields in sections:
+        html_parts.append(f'<div class="extraction-section">')
+        html_parts.append(f'<h4>{section_title}</h4>')
+        html_parts.append('<dl class="extraction-fields">')
+        for label, field_key in fields:
+            field = extraction.get(section_key, {}).get(field_key, {})
+            val = field.get("value")
+            conf = field.get("confidence", 0.0)
+            html_parts.append(
+                f'<dt>{label}</dt>'
+                f'<dd>{_display_value(val)} {_confidence_badge(conf)}</dd>'
+            )
+        html_parts.append('</dl></div>')
+
+    html_parts.append('</div>')
+    return "\n".join(html_parts)
+
+
+def compliance_banner_html(extraction: dict[str, Any]) -> str:
+    """Show controlled substance compliance status."""
+    is_controlled = extraction.get("document_metadata", {}).get("is_controlled_substance", False)
+    drug_name = get_field_value(extraction, "prescription_details", "drug_name") or "Unknown"
+
+    if not is_controlled:
+        return f"""
+        <div class="compliance-banner compliance-ok">
+            <strong>✓ Non-Controlled Substance</strong>
+            <span>Drug: {drug_name} — Patient address, prescriber DEA, and prescriber address are optional.</span>
+        </div>
+        """
+
+    # Check for missing mandatory fields
+    missing = []
+    if not get_field_value(extraction, "patient_info", "address"):
+        missing.append("Patient Address")
+    if not get_field_value(extraction, "prescriber_info", "address"):
+        missing.append("Prescriber Address")
+    if not get_field_value(extraction, "prescriber_info", "dea_number"):
+        missing.append("DEA Number")
+
+    if missing:
+        missing_list = ", ".join(missing)
+        return f"""
+        <div class="compliance-banner compliance-alert">
+            <strong>⚠ CONTROLLED SUBSTANCE — MISSING MANDATORY FIELDS</strong>
+            <span>Drug: {drug_name} — Missing: {missing_list}. Federal law requires these for DEA Schedule II-V drugs.</span>
+        </div>
+        """
+    else:
+        return f"""
+        <div class="compliance-banner compliance-warn">
+            <strong>⚡ Controlled Substance Detected</strong>
+            <span>Drug: {drug_name} — All mandatory fields (patient address, prescriber address, DEA) are present. Verify before dispensing.</span>
+        </div>
+        """
 
 
 def translated_prescription_html(plan: dict[str, Any]) -> str:
@@ -615,12 +961,19 @@ def translated_prescription_html(plan: dict[str, Any]) -> str:
     ]
     row_html = "".join(f"<dt>{label}</dt><dd>{value}</dd>" for label, value in rows)
     status = plan.get("status", "needs_review").replace("_", " ").title()
+    flags = plan.get("flags", [])
+    flags_html = ""
+    if flags:
+        flags_html = '<div class="validation-flags">' + " ".join(
+            f'<span class="flag-pill">{f}</span>' for f in flags
+        ) + '</div>'
     return f"""
     <div class="translated-card">
       <div class="translated-head">
         <h3>Translated Prescription</h3>
         <span class="status-pill">{status}</span>
       </div>
+      {flags_html}
       <dl class="details translated-details">{row_html}</dl>
       <p class="fine-print">Generated from OCR text and retrieval candidates. Confirm before dispensing.</p>
     </div>
@@ -670,19 +1023,22 @@ def ocr_compare_html(
     plan: dict[str, Any],
 ) -> str:
     corrected = display_name if plan.get("status") == "validated" else f"Needs review: {display_name}"
+    # Truncate long OCR text for display
+    ocr_display = ocr_text[:150] + "..." if len(ocr_text) > 150 else ocr_text
     return f"""
     <div class="compare-grid">
-      <div><span>OCR Output</span><strong>{ocr_text}</strong></div>
+      <div><span>Raw OCR Output</span><strong>{ocr_display}</strong></div>
       <div><span>AI Corrected</span><strong>{corrected}</strong></div>
       <div><span>Canonical</span><strong>{medicine['name'] if plan.get('status') == 'validated' else 'Not confirmed'}</strong></div>
     </div>
     """
 
 
+# ── OCR Function (Pass 1: MiniCPM-V full text extraction) ────────────────────
+
 def run_minicpm_ocr(pil_image: Image.Image) -> str:
+    """Pass 1: Use MiniCPM-V to read ALL text from the prescription image."""
     global OCR_MODEL, OCR_TOKENIZER
-    if not LIVE_GPU_OCR:
-        return DEMO_OCR_TEXT
 
     try:
         import torch
@@ -701,14 +1057,14 @@ def run_minicpm_ocr(pil_image: Image.Image) -> str:
         if torch.cuda.is_available():
             OCR_MODEL = OCR_MODEL.cuda()
 
-    messages = [{"role": "user", "content": [pil_image.convert("RGB"), DEMO_PROMPT]}]
+    messages = [{"role": "user", "content": [pil_image.convert("RGB"), FULL_OCR_PROMPT]}]
     kwargs = {
         "image": None,
         "msgs": messages,
         "tokenizer": OCR_TOKENIZER,
         "sampling": False,
         "stream": False,
-        "max_new_tokens": 20,
+        "max_new_tokens": 1024,
         "enable_thinking": False,
         "temperature": 0.0,
         "top_p": 0.1,
@@ -722,8 +1078,10 @@ def run_minicpm_ocr(pil_image: Image.Image) -> str:
 
     if not isinstance(raw_prediction, str):
         raw_prediction = "".join(list(raw_prediction))
-    return clean_prediction(raw_prediction) or raw_prediction.strip()
+    return raw_prediction.strip()
 
+
+# ── Main Analysis Pipeline ───────────────────────────────────────────────────
 
 @spaces.GPU(duration=300)
 def analyze_prescription(image, progress=gr.Progress()):
@@ -731,31 +1089,36 @@ def analyze_prescription(image, progress=gr.Progress()):
     if image is None:
         raise gr.Error("Upload or capture a prescription image first.")
 
-    for pct, label in [
-        (0.20, "Prescription uploaded"),
-        (0.35, "MiniCPM OCR reading handwriting"),
-    ]:
-        progress(pct, desc=label)
-        time.sleep(0.15)
+    # Step 1: Upload
+    progress(0.10, desc="Prescription uploaded")
+    time.sleep(0.1)
 
+    # Step 2: MiniCPM-V full text OCR
+    progress(0.20, desc="MiniCPM-V reading full prescription text...")
     ocr_text = run_minicpm_ocr(image)
     unload_ocr_model()
 
-    for pct, label in [
-        (0.70, "Retrieval search over medicine aliases"),
-        (0.88, "Nemotron prescription validation"),
-        (1.00, "Result prepared"),
-    ]:
-        progress(pct, desc=label)
-        time.sleep(0.25)
+    # Step 3: Nemotron structuring
+    progress(0.45, desc="Nemotron structuring extracted text into clinical JSON...")
+    extraction = structure_ocr_with_nemotron(ocr_text)
 
-    medicine, candidates, display_name, confidence = find_medicine_from_ocr(ocr_text)
-    plan = validate_with_nemotron(ocr_text, medicine, display_name, confidence, candidates)
+    # Step 4: Retrieval
+    progress(0.65, desc="Retrieval search over medicine aliases...")
+    drug_name = get_field_value(extraction, "prescription_details", "drug_name") or clean_prediction(ocr_text)
+    strength_hint = get_field_value(extraction, "prescription_details", "strength")
+    medicine, candidates, display_name, confidence = find_medicine_from_ocr(drug_name, strength_hint)
+
+    # Step 5: Validation
+    progress(0.80, desc="Nemotron validating prescription...")
+    plan = validate_with_nemotron(ocr_text, extraction, medicine, display_name, confidence, candidates)
     unload_nemotron_model()
+
+    progress(1.00, desc="Result prepared")
+
     accepted = plan.get("status") == "validated" and confidence >= ACCEPTANCE_THRESHOLD
     inventory = get_inventory(medicine)
     image_path = resolve_asset_path(medicine.get("image_path"))
-    package_image = str(image_path) if image_path and accepted else None
+    package_image_val = str(image_path) if image_path and accepted else None
 
     state = {
         "medicine_id": medicine["id"],
@@ -770,8 +1133,10 @@ def analyze_prescription(image, progress=gr.Progress()):
     return (
         load_kpi_metrics(SESSION_SEARCHES),
         pipeline_html(5, plan.get("status", "needs_review")),
+        compliance_banner_html(extraction),
+        extraction_card_html(extraction),
         medicine_details_html(medicine, inventory, ocr_text, display_name, confidence, plan),
-        package_image,
+        package_image_val,
         package_status_html(inventory, accepted),
         confidence_gauge(confidence),
         candidates_html(candidates),
@@ -1029,6 +1394,94 @@ CSS = """
   font-size: 13px;
 }
 .compact { margin-top: 0; }
+
+/* ── Extraction Card Styles ──────────────────────────────────────────────── */
+.extraction-card {
+  border: 1px solid var(--line);
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 20px;
+  margin-top: 12px;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.045);
+}
+.extraction-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.extraction-header h3 { color: var(--ink) !important; margin: 0; font-size: 20px; }
+.legibility-badge { font-size: 13px; color: var(--muted); }
+.extraction-section {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+  margin-top: 14px;
+}
+.extraction-section h4 {
+  color: var(--ink) !important;
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 700;
+}
+.extraction-fields {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 6px 14px;
+  margin: 0;
+}
+.extraction-fields dt { color: var(--muted) !important; font-size: 13px; }
+.extraction-fields dd { color: var(--ink) !important; margin: 0; font-weight: 600; font-size: 14px; }
+
+/* ── Compliance Banner Styles ────────────────────────────────────────────── */
+.compliance-banner {
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.compliance-banner strong { font-size: 14px; }
+.compliance-banner span { font-size: 13px; }
+.compliance-ok {
+  background: #ecfdf5;
+  border: 1px solid #86efac;
+  color: #065f46;
+}
+.compliance-ok strong { color: #065f46; }
+.compliance-ok span { color: #047857; }
+.compliance-warn {
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  color: #92400e;
+}
+.compliance-warn strong { color: #92400e; }
+.compliance-warn span { color: #b45309; }
+.compliance-alert {
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+}
+.compliance-alert strong { color: #991b1b; }
+.compliance-alert span { color: #b91c1c; }
+
+/* ── Validation Flags ────────────────────────────────────────────────────── */
+.validation-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.flag-pill {
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  color: #92400e;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .gradio-container button.primary,
 .gradio-container button[variant="primary"] {
   background: var(--green) !important;
@@ -1045,6 +1498,7 @@ CSS = """
   .powered { text-align: left; margin-top: 10px; }
   .metric-row, .flow, .stock-card, .compare-grid { grid-template-columns: 1fr; }
   .details { grid-template-columns: 1fr; }
+  .extraction-fields { grid-template-columns: 1fr; }
   .translated-head { align-items: flex-start; flex-direction: column; }
 }
 """
@@ -1089,7 +1543,9 @@ with gr.Blocks(title="PharmaCopilot") as demo:
             pipeline = gr.HTML(pipeline_html(0))
 
     with gr.Group(visible=False, elem_classes=["app-shell"]) as result_section:
-        gr.Markdown("## Medicine Result")
+        gr.Markdown("## Prescription Analysis Result")
+        compliance_banner = gr.HTML()
+        extraction_card = gr.HTML()
         with gr.Row():
             with gr.Column(scale=5):
                 details = gr.HTML()
@@ -1126,6 +1582,8 @@ with gr.Blocks(title="PharmaCopilot") as demo:
         outputs=[
             live_metrics,
             pipeline,
+            compliance_banner,
+            extraction_card,
             details,
             package_image,
             stock,

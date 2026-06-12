@@ -1,0 +1,16 @@
+# Ignore everything by default
+*
+
+# Allow repository configuration
+!.gitignore
+
+# Allow working code files
+!app.py
+!gradio_pharmacopilot_demo.py
+!requirements.txt
+!README.md
+
+# Ignore python caches and logs even if matching allowed patterns
+__pycache__/
+*.log
+*.pyc

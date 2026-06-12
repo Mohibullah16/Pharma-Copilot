@@ -579,7 +579,34 @@ def calculate_fallback_legibility(extraction: dict[str, Any]) -> float:
                     scores.append(conf)
     if not scores:
         return 0.0
-    return sum(scores) / len(scores)
+def is_valid_drug_line(line: str) -> bool:
+    line_lower = line.lower()
+    
+    # 1. Check if it contains standard drug forms
+    if re.search(r'\b(tab\.|cap\.|syp\.|inj\.|tablet|capsule|syrup|suspension|injection|cream|ointment|gel|drop|drops|spray|inhaler)\b', line_lower):
+        return True
+        
+    # 2. Check if it matches a known brand or generic name in the database
+    cleaned = re.sub(r'^\d+[\.\)]?\s*', '', line_lower).strip()
+    words = cleaned.split()
+    if words:
+        first_word = words[0].strip(" ,.-+()[]{}")
+        if first_word in BD_BRAND_TO_GENERIC or normalize(first_word) in MED_BY_NAME:
+            return True
+        if len(words) > 1:
+            two_words = " ".join(words[:2]).strip(" ,.-+()[]{}")
+            if two_words in BD_BRAND_TO_GENERIC or normalize(two_words) in MED_BY_NAME:
+                return True
+
+    # 3. Check if it contains strength indicators or dosage patterns
+    if re.search(r'\b\d+\s*(mg|g|ml|mcg|%)\b', line_lower) or re.search(r'\b\d+[\+\-]\d+[\+\-]\d+\b', line_lower):
+        return True
+        
+    # 4. Check if it contains common sig keywords
+    if re.search(r'\b(once daily|twice daily|daily|bid|tid|qid|qd|hs|po|cap|tab)\b', line_lower):
+        return True
+        
+    return False
 
 
 def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, Any]:
@@ -620,10 +647,14 @@ def parse_structured_extraction(raw_text: str, ocr_text: str = "") -> dict[str, 
         if focused_section:
             if "drug extraction" in line.lower() or "=== " in line:
                 continue
-            drugs.append(line)
+            clean_line = re.sub(r'^\d+[\.\)]?\s*', '', line).strip()
+            if is_valid_drug_line(clean_line):
+                drugs.append(line)
         else:
             if re.search(r'\b(tab\.|cap\.|syp\.|inj\.|tablet|capsule|syrup|medicine|rx)\b', line, re.I) or re.match(r'^[\d\-]+[\.\)]?\s+', line):
-                drugs.append(line)
+                clean_line = re.sub(r'^\d+[\.\)]?\s*', '', line).strip()
+                if is_valid_drug_line(clean_line):
+                    drugs.append(line)
                 
     # Deduplicate extracted drug lines while preserving order
     seen_drugs = set()
@@ -1349,22 +1380,62 @@ def run_minicpm_ocr(pil_image: Image.Image) -> tuple[str, Image.Image]:
         if torch.cuda.is_available():
             OCR_MODEL = OCR_MODEL.cuda()
 
-    # Pass 1A: Grounding to detect handwritten prescription items
-    grounding_prompt = "Identify all handwritten text regions (such as patient name, patient age, prescriber signature, drug name, dosage, refills). Return the coordinate boxes of these regions in [[ymin,xmin,ymax,xmax]] format."
-    grounding_output = _run_minicpm_single_pass(pil_image, grounding_prompt, max_tokens=512)
+    # Pass 1A: Detect text regions using OpenCV image processing (horizontal line-removal + contour extraction)
+    # This acts as a robust engineering layout analysis (not just prompt engineering grounding)
+    import numpy as np
+    import cv2
 
-    # Parse coordinates robustly supporting both brackets [[ymin,xmin,ymax,xmax]] and parentheses (ymin,xmin,ymax,xmax)
-    normalized_output = re.sub(r'\s+', ' ', grounding_output)
-    raw_matches = re.findall(r'(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})[\s,]+(\d{1,3})', normalized_output)
     boxes = []
-    for m in raw_matches:
-        try:
-            ymin, xmin, ymax, xmax = map(int, m)
-            if all(0 <= val <= 1000 for val in (ymin, xmin, ymax, xmax)):
-                if ymax > ymin and xmax > xmin:
-                    boxes.append((ymin, xmin, ymax, xmax))
-        except ValueError:
-            continue
+    try:
+        # Convert PIL image to OpenCV grayscale
+        img_np = np.array(pil_image.convert("RGB"))
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Otsu's binarization
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        h_img, w_img = gray.shape
+        
+        # Detect and remove printed table/grid lines to isolate text
+        h_size = max(15, int(w_img * 0.04))
+        v_size = max(15, int(h_img * 0.04))
+        
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_size, 1))
+        detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+        
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_size))
+        detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+        
+        clean = cv2.subtract(thresh, detect_horizontal)
+        clean = cv2.subtract(clean, detect_vertical)
+        
+        # Dilation to merge characters horizontally into cohesive text blocks
+        d_w = max(5, int(w_img * 0.03))
+        d_h = max(2, int(h_img * 0.005))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (d_w, d_h))
+        dilated = cv2.dilate(clean, kernel, iterations=2)
+        
+        # Find external contours
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            # Filter contours to target horizontal text lines
+            if w > w_img * 0.04 and h > h_img * 0.01 and w < w_img * 0.95 and h < h_img * 0.2:
+                if w > h * 1.1:
+                    # Convert to 0-1000 scale compatible with drawing/cropping code
+                    ymin_n = int(y / h_img * 1000)
+                    xmin_n = int(x / w_img * 1000)
+                    ymax_n = int((y + h) / h_img * 1000)
+                    xmax_n = int((x + w) / w_img * 1000)
+                    boxes.append((ymin_n, xmin_n, ymax_n, xmax_n))
+        
+        # Sort boxes top-to-bottom
+        boxes.sort(key=lambda b: b[0])
+    except Exception as exc:
+        print(f"OpenCV layout extraction error: {exc}")
+        boxes = []
 
     width, height = pil_image.size
     cropped_ocr_results = []

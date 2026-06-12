@@ -51,7 +51,7 @@ BRAND_MAP_PATH = data_path("training/bd_brand_to_generic.json")
 INVENTORY_PATH = data_path("inventory.json")
 
 MODEL_ID = os.getenv("PHARMACOPILOT_MODEL_ID", "openbmb/MiniCPM-V-4_5")
-NEMOTRON_MODEL_ID = os.getenv("NEMOTRON_MODEL_ID", "nvidia/Nemotron-Mini-4B-Instruct")
+NEMOTRON_MODEL_ID = os.getenv("NEMOTRON_MODEL_ID", "nvidia/Llama-3.1-Nemotron-Nano-8B-v1")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 NVIDIA_NIM_MODEL = os.getenv("NVIDIA_NIM_MODEL", "nvidia/nvidia-nemotron-nano-9b-v2")
@@ -92,35 +92,40 @@ def is_controlled_substance(drug_name: str) -> bool:
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 # Pass 1: MiniCPM-V reads ALL text from the prescription image
-FULL_OCR_PROMPT = """You are a medical prescription OCR engine. This prescription may contain text in multiple scripts (e.g., Bengali, Hindi, Arabic, English). Your job is to read and transcribe ALL text.
+# Pass 1A: Focused drug extraction — short, direct prompt to force reading Latin-script drug names
+DRUG_FOCUSED_PROMPT = """Look at this prescription image carefully. List ONLY the medicine/drug names and their dosages.
 
-PRIORITY ORDER — read these sections first:
-1. HANDWRITTEN CONTENT: Drug names (Tab., Cap., Inj., Syp.), dosages (mg, ml), frequencies (1+0+1, BD, TDS), durations
-2. Patient name and age/date of birth (often near top, after "Name:" or similar)
-3. Date of prescription
-4. Doctor/Prescriber name and credentials (often printed at top or stamped at bottom)
-5. Clinic/Hospital name, address, phone numbers
-6. Any other printed or stamped text
+Drug names on prescriptions are written in English/Latin letters like:
+- Tab. (tablet), Cap. (capsule), Syp. (syrup), Inj. (injection)
+- Examples: Tab. Paracetamol 500mg, Cap. Amoxicillin 250mg, Tab. Diclofenac 50mg
 
-OUTPUT FORMAT — structure your output like this:
-DOCTOR: [doctor name and credentials]
-CLINIC: [clinic/hospital name and address]
-PATIENT: [patient name]
+For each drug, write:
+- The drug name exactly as written
+- The strength if visible (e.g., 50mg, 200mg)
+- The dosage pattern if visible (e.g., 1+0+1, 2+0+2)
+
+List them numbered. If you cannot read a drug name, write [ILLEGIBLE].
+Do NOT translate or explain. Just list the drugs."""
+
+# Pass 1B: Full prescription text extraction
+FULL_OCR_PROMPT = """Read this medical prescription image. It may have Bengali/Hindi/Urdu printed headers and English handwritten content.
+
+Extract ALL information in this format:
+DOCTOR: [name and credentials from printed header or stamp]
+CLINIC: [clinic/hospital name]
+PATIENT: [patient name — usually handwritten near top]
 DATE: [prescription date]
+CHIEF COMPLAINT: [the medical condition/reason for visit if noted]
 Rx:
-1) [drug name] [strength] — [frequency/dosage instructions]
-2) [drug name] [strength] — [frequency/dosage instructions]
-...
-ADVICE: [any additional instructions, follow-up notes]
-SIGNATURE: [PRESENT/NOT VISIBLE]
+[list all drugs with strengths and dosage patterns]
+ADVICE: [follow-up instructions]
+SIGNATURE: [PRESENT or NOT VISIBLE]
 
-CRITICAL RULES:
-- Drug names are almost always written in English/Latin script (e.g., Tab. Diclofenac, Cap. Omeprazole) even on non-English prescriptions. READ THEM CAREFULLY.
-- Dosage patterns like "1+0+1", "2+0+2", "0+0+1" mean morning+afternoon+night doses
-- Transcribe EXACTLY as written — do NOT translate, correct spelling, or expand abbreviations
-- Read ALL numbered items (①, ②, ③ or 1), 2), 3) etc.)
-- If text is illegible, write [ILLEGIBLE]
-- Include ALL drugs — prescriptions often have 3-10 medications listed"""
+RULES:
+- Drug names are ALWAYS in English/Latin script (Tab., Cap., Syp.) — read them carefully
+- Dosage patterns like "2+0+2" mean morning+afternoon+night
+- Do NOT translate, correct spelling, or interpret — transcribe exactly as written
+- Read ALL numbered items"""
 
 # Pass 2: Nemotron structures the raw OCR into the clinical JSON schema
 STRUCTURING_PROMPT_TEMPLATE = """You are a HIPAA-compliant Clinical Data Extraction Agent.
@@ -781,8 +786,8 @@ def pipeline_html(stage: int = 0, validation_status: str = "waiting") -> str:
     }.get(validation_status, "Nemotron Review")
     steps = [
         ("Prescription", "uploaded"),
-        ("MiniCPM OCR", "full text extraction"),
-        ("Nemotron Parse", "structured JSON"),
+        ("MiniCPM OCR", "2-pass extraction"),
+        ("Nemotron 8B", "structured JSON"),
         ("Retrieval Engine", "ranked candidates"),
         (validation_label, "returned a decision"),
     ]
@@ -1046,8 +1051,36 @@ def ocr_compare_html(
 
 # ── OCR Function (Pass 1: MiniCPM-V full text extraction) ────────────────────
 
+def _run_minicpm_single_pass(pil_image: Image.Image, prompt: str, max_tokens: int = 512) -> str:
+    """Run a single MiniCPM-V inference pass with the given prompt."""
+    global OCR_MODEL, OCR_TOKENIZER
+
+    messages = [{"role": "user", "content": [pil_image.convert("RGB"), prompt]}]
+    kwargs = {
+        "image": None,
+        "msgs": messages,
+        "tokenizer": OCR_TOKENIZER,
+        "sampling": False,
+        "stream": False,
+        "max_new_tokens": max_tokens,
+        "enable_thinking": False,
+        "temperature": 0.0,
+        "top_p": 0.1,
+    }
+    try:
+        raw = OCR_MODEL.chat(**kwargs)
+    except TypeError:
+        kwargs.pop("temperature", None)
+        kwargs.pop("top_p", None)
+        raw = OCR_MODEL.chat(**kwargs)
+
+    if not isinstance(raw, str):
+        raw = "".join(list(raw))
+    return raw.strip()
+
+
 def run_minicpm_ocr(pil_image: Image.Image) -> str:
-    """Pass 1: Use MiniCPM-V to read ALL text from the prescription image."""
+    """Multi-pass OCR: Run focused drug extraction first, then full text extraction, and combine."""
     global OCR_MODEL, OCR_TOKENIZER
 
     try:
@@ -1067,28 +1100,19 @@ def run_minicpm_ocr(pil_image: Image.Image) -> str:
         if torch.cuda.is_available():
             OCR_MODEL = OCR_MODEL.cuda()
 
-    messages = [{"role": "user", "content": [pil_image.convert("RGB"), FULL_OCR_PROMPT]}]
-    kwargs = {
-        "image": None,
-        "msgs": messages,
-        "tokenizer": OCR_TOKENIZER,
-        "sampling": False,
-        "stream": False,
-        "max_new_tokens": 1024,
-        "enable_thinking": False,
-        "temperature": 0.0,
-        "top_p": 0.1,
-    }
-    try:
-        raw_prediction = OCR_MODEL.chat(**kwargs)
-    except TypeError:
-        kwargs.pop("temperature", None)
-        kwargs.pop("top_p", None)
-        raw_prediction = OCR_MODEL.chat(**kwargs)
+    # Pass 1A: Focused drug extraction (short, direct)
+    drug_pass = _run_minicpm_single_pass(pil_image, DRUG_FOCUSED_PROMPT, max_tokens=512)
 
-    if not isinstance(raw_prediction, str):
-        raw_prediction = "".join(list(raw_prediction))
-    return raw_prediction.strip()
+    # Pass 1B: Full prescription text extraction
+    full_pass = _run_minicpm_single_pass(pil_image, FULL_OCR_PROMPT, max_tokens=1024)
+
+    # Combine both passes — drug-focused pass takes priority for medication data
+    combined = f"""=== DRUG EXTRACTION (focused pass) ===
+{drug_pass}
+
+=== FULL PRESCRIPTION TEXT ===
+{full_pass}"""
+    return combined
 
 
 # ── Main Analysis Pipeline ───────────────────────────────────────────────────
@@ -1104,7 +1128,7 @@ def analyze_prescription(image, progress=gr.Progress()):
     time.sleep(0.1)
 
     # Step 2: MiniCPM-V full text OCR
-    progress(0.20, desc="MiniCPM-V reading full prescription text...")
+    progress(0.20, desc="MiniCPM-V multi-pass OCR (drug-focused + full text)...")
     ocr_text = run_minicpm_ocr(image)
     unload_ocr_model()
 

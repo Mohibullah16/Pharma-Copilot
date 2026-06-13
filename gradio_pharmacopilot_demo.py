@@ -1095,18 +1095,28 @@ def medicine_details_html(
     """
 
 
-def _confidence_badge(conf: float) -> str:
+def _confidence_badge(conf: float | None) -> str:
     """Return a colored confidence badge."""
-    if conf >= 0.85:
-        color, bg = "#065f46", "#d1fae5"
-    elif conf >= 0.50:
-        color, bg = "#92400e", "#fef3c7"
-    elif conf > 0:
-        color, bg = "#991b1b", "#fee2e2"
-    else:
+    if conf is None:
         color, bg = "#6b7280", "#f3f4f6"
-    pct = f"{conf * 100:.0f}%"
+        pct = "0%"
+    else:
+        try:
+            conf_val = float(conf)
+            if conf_val >= 0.85:
+                color, bg = "#065f46", "#d1fae5"
+            elif conf_val >= 0.50:
+                color, bg = "#92400e", "#fef3c7"
+            elif conf_val > 0:
+                color, bg = "#991b1b", "#fee2e2"
+            else:
+                color, bg = "#6b7280", "#f3f4f6"
+            pct = f"{conf_val * 100:.0f}%"
+        except (ValueError, TypeError):
+            color, bg = "#6b7280", "#f3f4f6"
+            pct = "0%"
     return f'<span style="background:{bg};color:{color};padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700;">{pct}</span>'
+
 
 
 def _display_value(val: Any) -> str:
